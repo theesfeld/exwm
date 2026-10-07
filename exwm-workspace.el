@@ -1060,6 +1060,15 @@ Signal a `user-error' when every window on FRAME is dedicated."
         (xcb:flush exwm--connection)))
     (setq exwm-workspace--switch-history-outdated t)))
 
+(defun exwm-workspace--buffer-annotation (name)
+  "Annotate buffer NAME with the workspace that holds it."
+  (when-let* ((buffer (get-buffer name)))
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'exwm-mode)
+                 (frame-live-p exwm--frame))
+        (format "  (workspace %s)"
+                (exwm-workspace--position exwm--frame))))))
+
 (defun exwm-workspace-switch-to-buffer (buffer-or-name)
   "Make selected window display BUFFER-OR-NAME."
   (interactive
@@ -1075,7 +1084,12 @@ Signal a `user-error' when every window on FRAME is dedicated."
                (rename-buffer (substring (buffer-name) 1)))))))
      (prog1
          (with-local-quit
-           (list (get-buffer (read-buffer-to-switch "Switch to buffer: "))))
+           (let ((completion-category-overrides
+                  (cons '(buffer
+                          (annotation-function
+                           . exwm-workspace--buffer-annotation))
+                        completion-category-overrides)))
+             (list (get-buffer (read-buffer-to-switch "Switch to buffer: ")))))
        ;; Hide buffers on other workspaces
        (unless exwm-workspace-show-all-buffers
          (dolist (pair exwm--id-buffer-alist)
