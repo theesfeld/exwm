@@ -575,9 +575,20 @@ DATA contains unmarshalled PropertyNotify event data."
       (let ((frame (car (last exwm-workspace--list))))
         (delete-frame frame))))))
 
+(defvar exwm-workspace-current-index)
+(defvar exwm-workspace--create-silently)
+
 (defun exwm--on-net-current-desktop (_id data)
   "Handle _NET_CURRENT_DESKTOP message with DATA."
-  (exwm-workspace-switch (elt data 0)))
+  (let ((index (elt data 0))
+        (previous exwm-workspace-current-index))
+    (exwm-workspace-switch index)
+    (when (and (not exwm-workspace--create-silently)
+               (integerp index)
+               (integerp previous)
+               (/= index previous))
+      (message "EXWM switched to workspace %d (from workspace %d)"
+               exwm-workspace-current-index previous))))
 
 (defun exwm--on-net-active-window (id _data)
   "Handle _NET_ACTIVE_WINDOW message with ID."
