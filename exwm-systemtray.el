@@ -80,15 +80,33 @@ of the screen."
 (defvar exwm-systemtray--embedder-window-depth nil
   "The embedder window's depth.")
 
-(defcustom exwm-systemtray-background-color 'default
-  "Background color of systemtray.
-This should be a color, the symbol `transparent' for transparent
-background, or a face symbol like `default' or `tab-bar'.
+(defcustom exwm-systemtray-workspace nil
+  "Where to show the one system tray.
+Nil follows the selected workspace.  An integer is a workspace
+index.  A string is a RandR output name: the tray stays on the
+visible workspace of that output.  XEmbed allows one tray, so
+icons cannot be embedded on every workspace at once.  A separate
+minibuffer frame keeps the tray on that frame either way."
+  :type '(choice (const :tag "Follow the selected workspace" nil)
+                 (integer :tag "Workspace index")
+                 (string :tag "Monitor name"))
+  :initialize #'custom-initialize-default
+  :set #'exwm-systemtray--set-workspace)
 
-Transparent background is not yet supported when Emacs uses 32-bit depth
-visual, as reported by `x-display-planes'.  The X resource \"Emacs.visualClass:
-TrueColor-24\" can be used to force Emacs to use 24-bit depth."
-  :type '(choice (const :tag "Transparent" transparent)
+(defcustom exwm-systemtray-background-color 'default
+  "Background color of the system tray.
+This should be a color, the symbol `transparent', or a face such
+as `default' or `tab-bar'.  `workspace-background' is accepted
+and treated as `default'.
+
+`transparent' uses a ParentRelative background.  That is valid
+only when the embedder's depth matches Emacs, as reported by
+`x-display-planes'.  It shows the parent frame through the tray.
+It is not alpha blending, and a 32-bit visual does not make the
+icons transparent when the depths differ.  EXWM does not
+composite.  The value is kept until both depths are known.  A
+known mismatch falls back to `default'."
+  :type '(choice (const :tag "ParentRelative" transparent)
                  (const :tag "Frame background" default)
                  (const :tag "Tab-bar background" tab-bar)
                  (color :tag "Color"))
@@ -99,10 +117,11 @@ TrueColor-24\" can be used to force Emacs to use 24-bit depth."
  of `workspace-background' for `exwm-systemtray-background-color'.")
            (setq value 'default))
          (when (and (eq value 'transparent)
+                    (exwm-systemtray--transparency-depths)
                     (not (exwm-systemtray--transparency-supported-p)))
            (display-warning 'exwm-systemtray
-                            "Transparent background is not supported yet when \
-using 32-bit depth.  Using `default' instead.")
+                            "ParentRelative background needs the tray and \
+Emacs to use the same visual depth.  Using `default' instead.")
            (setq value 'default))
          (set-default symbol value)
          (when (and exwm-systemtray-mode
@@ -301,11 +320,14 @@ window; unmap & map are necessary for the background color to take effect."
              exwm-systemtray--embedder-window)
     (let* ((color (pcase exwm-systemtray-background-color
                     ((or `transparent `nil) ; nil means transparent as well
-                     (if (exwm-systemtray--transparency-supported-p)
-                         nil
-                       (message "%s" "[EXWM] system tray does not support \
-`transparent' background; using `default' instead")
-                       (face-background 'default exwm-workspace--current)))
+                     (cond
+                      ((exwm-systemtray--transparency-supported-p) nil)
+                      ((exwm-systemtray--transparency-depths)
+                       (message "%s" "[EXWM] system tray ParentRelative background \
+needs matching visual depths; using `default' instead")
+                       (face-background 'default exwm-workspace--current))
+                      (t
+                       (face-background 'default exwm-workspace--current))))
                     ((pred facep)
                      (face-background exwm-systemtray-background-color
                                       exwm-workspace--current))
@@ -335,20 +357,75 @@ window; unmap & map are necessary for the background color to take effect."
                                    :background-pixmap xcb:BackPixmap:ParentRelative
                                    :background-pixel background-pixel)))))
 
-(defun exwm-systemtray--transparency-supported-p ()
-  "Check whether transparent background is supported.
-EXWM system tray supports transparency when the visual depth of the system tray
-window matches that of Emacs.  The visual depth of the system tray window is the
-default visual depth of the display.
+(defun exwm-systemtray--transparency-depths (&optional emacs-planes
+                                                       embedder-depth)
+  "Return (PLANES . DEPTH) when both depths are known.
+EMACS-PLANES defaults to `x-display-planes'.  EMBEDDER-DEPTH
+defaults to `exwm-systemtray--embedder-window-depth'.  Return nil
+when either value is missing or not a positive integer."
+  (let ((planes (or emacs-planes
+                    (and (display-graphic-p) (x-display-planes))))
+        (depth (or embedder-depth exwm-systemtray--embedder-window-depth)))
+    (and (integerp planes) (integerp depth)
+         (> planes 0) (> depth 0)
+         (cons planes depth))))
+
+(defun exwm-systemtray--transparency-supported-p (&optional emacs-planes
+                                                            embedder-depth)
+  "Return non-nil when a ParentRelative tray background is valid.
+EMACS-PLANES and EMBEDDER-DEPTH are as in
+`exwm-systemtray--transparency-depths'.  The depths must be equal.
+ParentRelative then shows the parent frame.  It does not blend
+alpha, so a 32-bit visual is not transparency by itself.
 
 Sections \"Visual and background pixmap handling\" and
-\"_NET_SYSTEM_TRAY_VISUAL\" of the System Tray Protocol Specification
-\(https://specifications.freedesktop.org/systemtray-spec/systemtray-spec-latest.html#visuals)
-indicate how to support actual transparency."
-  (let ((planes (x-display-planes)))
-    (if exwm-systemtray--embedder-window-depth
-        (= planes exwm-systemtray--embedder-window-depth)
-      (<= planes 24))))
+\"_NET_SYSTEM_TRAY_VISUAL\" of the System Tray Protocol
+Specification describe a real alpha visual.  This embedder is
+created with the root visual, and EXWM does not composite."
+  (let ((depths (exwm-systemtray--transparency-depths emacs-planes
+                                                       embedder-depth)))
+    (and depths (= (car depths) (cdr depths)))))
+
+(defun exwm-systemtray--choose-frame (pin frames current)
+  "Return the workspace frame that should parent the tray.
+FRAMES is a list of (FRAME MONITOR ACTIVE) in workspace order.
+PIN nil returns CURRENT.  An integer is that index, limited to
+the existing frames.  A string is the active frame on that
+monitor, or the first frame there, or else CURRENT."
+  (cond
+   ((null frames) current)
+   ((integerp pin)
+    (car (nth (max 0 (min pin (1- (length frames)))) frames)))
+   ((and (stringp pin) (not (string-empty-p pin)))
+    (or (car (cl-find-if (lambda (row)
+                           (and (equal (nth 1 row) pin)
+                                (nth 2 row)))
+                         frames))
+        (car (cl-find-if (lambda (row)
+                           (equal (nth 1 row) pin))
+                         frames))
+        current))
+   (t current)))
+
+(defun exwm-systemtray--embedder-frame ()
+  "Return the frame that currently parents the system tray."
+  (if (exwm-workspace--minibuffer-own-frame-p)
+      exwm-workspace--minibuffer
+    (exwm-systemtray--choose-frame
+     exwm-systemtray-workspace
+     (mapcar (lambda (frame)
+               (list frame
+                     (frame-parameter frame 'exwm-randr-monitor)
+                     (exwm-workspace--active-p frame)))
+             exwm-workspace--list)
+     exwm-workspace--current)))
+
+(defun exwm-systemtray--set-workspace (symbol value)
+  "Set SYMBOL to VALUE and move the tray if it is running."
+  (set-default symbol value)
+  (when (and exwm-systemtray--connection
+             exwm-systemtray--embedder-window)
+    (exwm-systemtray--on-workspace-switch)))
 
 (defun exwm-systemtray--on-DestroyNotify (data _synthetic)
   "Unembed icons on DestroyNotify.
@@ -452,32 +529,40 @@ Argument DATA contains the raw event data."
                        :event (xcb:marshal obj exwm-systemtray--connection))))
   (xcb:flush exwm-systemtray--connection))
 
-(defun exwm-systemtray--y-position ()
-  "Y position of system tray."
-  (let ((pos exwm-systemtray-position))
+(defun exwm-systemtray--y-position (&optional frame)
+  "Y position of the system tray on FRAME.
+FRAME defaults to the frame that parents the tray."
+  (let ((pos exwm-systemtray-position)
+        (frame (or frame (exwm-systemtray--embedder-frame)
+                   exwm-workspace--current)))
     (cond
      ((or (eq pos 'bottom) (and (fixnump pos) (<= pos 0)))
       ;; On GTK, pixel-height != outer-height. The frame-pixel-height is the height of the inner
       ;; frame window (corresponding to window-id) while the frame-outer-height corresponds to the
       ;; frame itself (outer-id). We embed relative to "window-id", so we need the pixel-height.
-      (- (frame-pixel-height exwm-workspace--current)
+      (- (frame-pixel-height frame)
          exwm-systemtray-height
          (if (fixnump pos) (- pos) 0)))
      ((fixnump pos) pos)
      (t 0))))
 
 (defun exwm-systemtray--on-workspace-switch ()
-  "Reparent/Refresh the system tray in `exwm-workspace-switch-hook'."
+  "Reparent and refresh the system tray after a workspace change.
+The parent is `exwm-systemtray-workspace' when that names a
+workspace or monitor.  Otherwise it is the selected workspace.
+A separate minibuffer frame keeps the parent it was given."
   (exwm--log)
   (unless (exwm-workspace--minibuffer-own-frame-p)
-    (xcb:+request exwm-systemtray--connection
-        (make-instance 'xcb:ReparentWindow
-                       :window exwm-systemtray--embedder-window
-                       :parent (string-to-number
-                                (frame-parameter exwm-workspace--current
-                                                 'window-id))
-                       :x 0
-                       :y (exwm-systemtray--y-position))))
+    (let ((frame (exwm-systemtray--embedder-frame)))
+      (when (and frame (frame-live-p frame)
+                 (frame-parameter frame 'window-id))
+        (xcb:+request exwm-systemtray--connection
+            (make-instance 'xcb:ReparentWindow
+                           :window exwm-systemtray--embedder-window
+                           :parent (string-to-number
+                                    (frame-parameter frame 'window-id))
+                           :x 0
+                           :y (exwm-systemtray--y-position frame))))))
   (exwm-systemtray--refresh-background-color)
   (exwm-systemtray--refresh))
 
@@ -489,11 +574,13 @@ Argument DATA contains the raw event data."
   "Reposition/Refresh the system tray."
   (exwm--log)
   (unless (exwm-workspace--minibuffer-own-frame-p)
-    (xcb:+request exwm-systemtray--connection
-        (make-instance 'xcb:ConfigureWindow
-                       :window exwm-systemtray--embedder-window
-                       :value-mask xcb:ConfigWindow:Y
-                       :y (exwm-systemtray--y-position))))
+    (let ((frame (exwm-systemtray--embedder-frame)))
+      (when (and frame (frame-live-p frame))
+        (xcb:+request exwm-systemtray--connection
+            (make-instance 'xcb:ConfigureWindow
+                           :window exwm-systemtray--embedder-window
+                           :value-mask xcb:ConfigWindow:Y
+                           :y (exwm-systemtray--y-position frame))))))
   (exwm-systemtray--refresh))
 
 (cl-defun exwm-systemtray--init ()
@@ -584,9 +671,10 @@ Argument DATA contains the raw event data."
                     (- (line-pixel-height) exwm-systemtray-height)
                   ;; Vertically centered.
                   (/ (- (line-pixel-height) exwm-systemtray-height) 2)))
-      (setq frame exwm-workspace--current
+      (setq frame (or (exwm-systemtray--embedder-frame)
+                      exwm-workspace--current)
             ;; Bottom aligned.
-            y (exwm-systemtray--y-position)))
+            y (exwm-systemtray--y-position frame)))
     (setq parent (string-to-number (frame-parameter frame 'window-id)))
     ;; Use default depth, visual and colormap (from root window), instead of
     ;; Emacs frame's.  See Section "Visual and background pixmap handling" in
@@ -658,7 +746,7 @@ Argument DATA contains the raw event data."
   (add-hook 'menu-bar-mode-hook #'exwm-systemtray--refresh-all)
   (add-hook 'tool-bar-mode-hook #'exwm-systemtray--refresh-all)
   (when (boundp 'exwm-randr-refresh-hook)
-    (add-hook 'exwm-randr-refresh-hook #'exwm-systemtray--refresh-all))
+    (add-hook 'exwm-randr-refresh-hook #'exwm-systemtray--on-workspace-switch))
   ;; The struts can be updated already.
   (when exwm-workspace--workareas
     (exwm-systemtray--refresh-all)))
@@ -695,7 +783,8 @@ Argument DATA contains the raw event data."
     (remove-hook 'menu-bar-mode-hook #'exwm-systemtray--refresh-all)
     (remove-hook 'tool-bar-mode-hook #'exwm-systemtray--refresh-all)
     (when (boundp 'exwm-randr-refresh-hook)
-      (remove-hook 'exwm-randr-refresh-hook #'exwm-systemtray--refresh-all))))
+      (remove-hook 'exwm-randr-refresh-hook
+                   #'exwm-systemtray--on-workspace-switch))))
 
 (provide 'exwm-systemtray)
 ;;; exwm-systemtray.el ends here
