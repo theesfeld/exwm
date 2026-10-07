@@ -224,6 +224,7 @@ current.")
 (declare-function exwm-workspace--update-workareas "exwm-workspace.el" ())
 (declare-function exwm-workspace--workarea "exwm-workspace.el" (frame))
 (declare-function exwm-workspace--active-p "exwm-workspace.el" (frame))
+(declare-function exwm-workspace--raise-child-frames "exwm-workspace.el" ())
 (declare-function exwm-layout--hide "exwm-layout.el" (id))
 
 (defun exwm-manage-get-pid (&optional id)
@@ -1099,6 +1100,12 @@ DATA contains unmarshalled MapNotify event data."
                                                  xcb:ConfigWindow:StackMode)
                              :sibling exwm--guide-window
                              :stack-mode xcb:StackMode:Above))))
+      ;; MapNotify stacks the client above the guide window after
+      ;; `exwm-layout--show' has returned.  Raise child frames again so
+      ;; that restack does not cover them.  A floating MapNotify uses
+      ;; StackMode Above with no sibling, which would otherwise put the
+      ;; client at the top.
+      (exwm-workspace--raise-child-frames)
       (xcb:flush exwm--connection))))
 
 (defun exwm-manage--on-DestroyNotify (data synthetic)

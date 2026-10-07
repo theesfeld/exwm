@@ -95,6 +95,7 @@ inside a correctly sized container."
                   (workspace))
 (declare-function exwm-workspace-move-window "exwm-workspace.el"
                   (frame-or-index &optional id))
+(declare-function exwm-workspace--raise-child-frames "exwm-workspace.el" ())
 
 (defun exwm-layout--set-state (id state)
   "Set WM_STATE of X window ID to STATE."
@@ -204,6 +205,9 @@ See variable `exwm-layout-auto-iconify'."
             (delq xcb:Atom:_NET_WM_STATE_HIDDEN exwm--ewmh-state))
       (exwm-layout--set-ewmh-state id)
       (exwm-layout--auto-iconify)))
+  ;; The client was just mapped above the workspace frame.  Raise child
+  ;; frames after it so a popup stays visible over that client.
+  (exwm-workspace--raise-child-frames)
   (xcb:flush exwm--connection))
 
 (defun exwm-layout--hide (id)

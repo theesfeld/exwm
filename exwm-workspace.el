@@ -129,6 +129,31 @@ Please manually run the hook `exwm-workspace-list-change-hook' afterwards.")
 (defvar exwm-workspace--minibuffer nil
   "The minibuffer frame shared among all frames.")
 
+(defconst exwm-workspace--child-frame-park -10000
+  "Root position used to park a child frame whose workspace is hidden.
+The frame keeps its size, so the position has to leave the whole frame
+off screen.  -10000 is past any monitor this code places.")
+
+(defvar exwm-workspace--child-frames nil
+  "Alist of Emacs child frames promoted to the root window.
+Each entry is (OUTER-ID ABS-X ABS-Y REL-X REL-Y).  OUTER-ID is the
+frame's outer X window.  ABS-X and ABS-Y are the root coordinates last
+applied.  REL-X and REL-Y are that position relative to the parent
+frame's native origin.
+
+A child frame is an X child of its parent frame.  Tiled clients are
+siblings of the workspace frame, stacked above it, so a child of the
+workspace cannot cover them.  Promoting the child frame to the root
+makes it a sibling that can.  Emacs keeps sending parent-relative
+positions after that (see `x_set_offset' and `gtk_window_move').")
+
+(defvar exwm-workspace--frame-listener nil
+  "Non-nil once ConfigureNotify and ReparentNotify listeners are attached.")
+
+(defvar exwm-workspace--child-frame-reparent-guard nil
+  "Outer window ids whose reparent-to-root was just corrected.
+Stops a client that immediately reparents the frame back from looping.")
+
 (defvar exwm-workspace--original-handle-focus-in
   (symbol-function #'handle-focus-in))
 (defvar exwm-workspace--original-handle-focus-out
@@ -431,6 +456,9 @@ ACTIVE indicates whether to set the frame active or inactive."
       (exwm-workspace--set-fullscreen frame)
     (exwm--set-geometry (frame-parameter frame 'exwm-container) nil nil 1 1))
   (exwm-layout--refresh frame)
+  ;; Park child frames of a workspace that just became inactive, and
+  ;; put them back when it is shown again.
+  (exwm-workspace--raise-child-frames)
   (xcb:flush exwm--connection))
 
 (defun exwm-workspace--active-p (frame)
@@ -453,6 +481,9 @@ ACTIVE indicates whether to set the frame active or inactive."
         (exwm--set-geometry container x y 1 1))
       (exwm--set-geometry id nil nil width height)
       (xcb:flush exwm--connection)))
+  ;; The workspace moved or resized.  Child frames are on the root, so
+  ;; they do not follow the parent window on their own.
+  (exwm-workspace--raise-child-frames)
   ;; This is only used for workspace initialization.
   (when exwm-workspace--fullscreen-frame-count
     (incf exwm-workspace--fullscreen-frame-count)))
@@ -1057,6 +1088,10 @@ PARAMS are the original arguments."
                                 (frame-parameter frame 'outer-window-id))
                        :value-mask xcb:CW:OverrideRedirect
                        :override-redirect 1))
+    ;; A child frame's X parent is the parent frame, which is stacked
+    ;; under managed clients.  Promote it before anything maps it.
+    ;; Floating frames have no parent-frame, so this leaves them alone.
+    (exwm-workspace--promote-child-frame frame)
     (xcb:flush exwm--connection)
     frame))
 
@@ -1142,13 +1177,326 @@ account when calculating the height."
       (exwm--log "%s" height)
       (set-frame-height exwm-workspace--minibuffer height))))
 
+(defun exwm-workspace--position-pixel (value)
+  "Return VALUE as a pixel offset.
+Integers pass through.  `(+ N)' and `(- N)' are the position forms
+Emacs stores in the `left' and `top' frame parameters.  Anything else
+yields 0."
+  (cond
+   ((integerp value) value)
+   ((and (consp value)
+         (memq (car value) '(+ -))
+         (integerp (cadr value)))
+    (if (eq (car value) '-)
+        (- (cadr value))
+      (cadr value)))
+   (t 0)))
+
+(defun exwm-workspace--pixel-offset (frame parameter)
+  "Return FRAME's PARAMETER (`left' or `top') as a pixel offset."
+  (exwm-workspace--position-pixel (frame-parameter frame parameter)))
+
+(defun exwm-workspace--frame-native-origin (frame)
+  "Return (X . Y) of FRAME's native edges, or nil."
+  (when (frame-live-p frame)
+    (let ((edges (frame-edges frame 'native-edges)))
+      (when (consp edges)
+        (cons (nth 0 edges) (nth 1 edges))))))
+
+(defun exwm-workspace--frame-by-outer-id (outer-id)
+  "Return the live frame whose outer X window is OUTER-ID."
+  (catch 'found
+    (dolist (frame (frame-list))
+      (when (eq outer-id
+                (string-to-number
+                 (or (frame-parameter frame 'outer-window-id) "")))
+        (throw 'found frame)))))
+
+(defun exwm-workspace--root-frame (frame)
+  "Return the ancestor of FRAME that has no `parent-frame'."
+  (let ((parent (and (frame-live-p frame)
+                     (frame-parameter frame 'parent-frame))))
+    (if (frame-live-p parent)
+        (exwm-workspace--root-frame parent)
+      frame)))
+
+(defun exwm-workspace--child-frame-workspace (frame)
+  "Return the workspace FRAME is shown on, or nil."
+  (let ((root (exwm-workspace--root-frame frame)))
+    (cond
+     ((exwm-workspace--workspace-p root) root)
+     ((and (frame-live-p root)
+           (frame-parameter root 'exwm-container))
+      (let ((buffer (window-buffer (frame-selected-window root))))
+        (when (buffer-live-p buffer)
+          (buffer-local-value 'exwm--frame buffer)))))))
+
+(defun exwm-workspace--child-frame-hidden-p (frame)
+  "Non-nil when FRAME's workspace is not active."
+  (let ((workspace (exwm-workspace--child-frame-workspace frame)))
+    (and workspace (not (exwm-workspace--active-p workspace)))))
+
+(defun exwm-workspace--child-frame-note (outer-id abs-x abs-y rel-x rel-y)
+  "Record OUTER-ID at root position ABS-X ABS-Y and parent-relative REL-X REL-Y.
+Recording happens before the ConfigureWindow that applies ABS-X ABS-Y,
+so the echo event matches this entry and is ignored."
+  (setq exwm-workspace--child-frames
+        (cons (list outer-id abs-x abs-y rel-x rel-y)
+              (assq-delete-all outer-id exwm-workspace--child-frames))))
+
+(defun exwm-workspace--child-frame-target
+    (event-x event-y abs-x abs-y parent-x parent-y hidden)
+  "Return (ABS-X . ABS-Y) for a child-frame ConfigureNotify, or nil.
+EVENT-X and EVENT-Y are the coordinates the server reports.  ABS-X and
+ABS-Y are the root position last applied, or nil.  PARENT-X and
+PARENT-Y are the parent frame's native origin; nil is treated as 0.
+HIDDEN non-nil parks the frame off screen.
+
+An event that already equals the last applied position is the echo of
+EXWM's own ConfigureWindow.  Any other event is the parent-relative
+position Emacs requested (`x_set_offset' stores that offset and then
+moves the window).  After the window has been reparented to the root,
+the server treats that offset as a root coordinate, so the parent
+origin is added once.  The echo must be ignored: adding the origin to
+a position EXWM already translated would walk the frame across the
+screen."
+  (cond
+   ((and (numberp abs-x) (numberp abs-y)
+         (= event-x abs-x) (= event-y abs-y))
+    nil)
+   (hidden
+    (cons exwm-workspace--child-frame-park
+          exwm-workspace--child-frame-park))
+   (t
+    (cons (+ event-x (or parent-x 0))
+          (+ event-y (or parent-y 0))))))
+
+(defun exwm-workspace--move-child-frame (outer-id x y &optional raise)
+  "Move child-frame window OUTER-ID to root coordinates X Y.
+When RAISE is non-nil, stack it above other windows."
+  (xcb:+request exwm--connection
+      (make-instance 'xcb:ConfigureWindow
+                     :window outer-id
+                     :value-mask (logior xcb:ConfigWindow:X
+                                         xcb:ConfigWindow:Y
+                                         (if raise
+                                             xcb:ConfigWindow:StackMode
+                                           0))
+                     :x x
+                     :y y
+                     :stack-mode xcb:StackMode:Above)))
+
+(defun exwm-workspace--forget-child-frame (frame)
+  "Drop FRAME from `exwm-workspace--child-frames'."
+  (let ((outer (frame-parameter frame 'outer-window-id)))
+    (when outer
+      (setq exwm-workspace--child-frames
+            (assq-delete-all (string-to-number outer)
+                             exwm-workspace--child-frames)))))
+
+(defun exwm-workspace--promote-child-frame (frame)
+  "Reparent child frame FRAME to the root so it can cover X clients.
+Floating frames have no `parent-frame' and are left to their
+container.  A child of a frame that was itself promoted stays inside
+that frame, which is already above X clients."
+  (when (and (frame-live-p frame)
+             exwm--connection
+             (slot-value exwm--connection 'connected)
+             (eq (frame-terminal frame) exwm--terminal))
+    (let ((parent (frame-parameter frame 'parent-frame))
+          (outer (frame-parameter frame 'outer-window-id)))
+      (when (and (frame-live-p parent)
+                 (stringp outer)
+                 (not (exwm-workspace--workspace-p frame))
+                 (not (eq frame exwm-workspace--minibuffer))
+                 (not (frame-parameter frame 'exwm-container)))
+        (let* ((outer-id (string-to-number outer))
+               (parent-outer (frame-parameter parent 'outer-window-id)))
+          (unless (or (assq outer-id exwm-workspace--child-frames)
+                      (and (stringp parent-outer)
+                           (assq (string-to-number parent-outer)
+                                 exwm-workspace--child-frames)))
+            (let* ((edges (frame-edges frame 'outer-edges))
+                   (origin (exwm-workspace--frame-native-origin parent))
+                   (origin-x (or (car origin) 0))
+                   (origin-y (or (cdr origin) 0))
+                   (abs-x (if (consp edges)
+                              (nth 0 edges)
+                            (+ origin-x
+                               (exwm-workspace--pixel-offset frame 'left))))
+                   (abs-y (if (consp edges)
+                              (nth 1 edges)
+                            (+ origin-y
+                               (exwm-workspace--pixel-offset frame 'top))))
+                   (rel-x (- abs-x origin-x))
+                   (rel-y (- abs-y origin-y)))
+              (exwm--log "child-frame #x%x -> %d,%d (rel %d,%d)"
+                         outer-id abs-x abs-y rel-x rel-y)
+              ;; Record first so the ConfigureNotify from this reparent
+              ;; is recognized as an echo.
+              (exwm-workspace--child-frame-note
+               outer-id abs-x abs-y rel-x rel-y)
+              ;; StructureNotify on this connection does not replace
+              ;; Emacs's mask.  XELB is a separate X client.
+              (xcb:+request exwm--connection
+                  (make-instance 'xcb:ChangeWindowAttributes
+                                 :window outer-id
+                                 :value-mask xcb:CW:EventMask
+                                 :event-mask xcb:EventMask:StructureNotify))
+              (xcb:+request exwm--connection
+                  (make-instance 'xcb:ReparentWindow
+                                 :window outer-id
+                                 :parent exwm--root
+                                 :x abs-x
+                                 :y abs-y))
+              (exwm-workspace--move-child-frame outer-id abs-x abs-y t)
+              (xcb:flush exwm--connection))))))))
+
+(defun exwm-workspace--raise-child-frames ()
+  "Stack promoted child frames above X clients, or park hidden ones."
+  (when (and exwm--connection
+             (slot-value exwm--connection 'connected))
+    ;; Newest entry is at the head.  Raise oldest first so the newest
+    ;; child frame ends up above the others.
+    (dolist (entry (nreverse (copy-sequence exwm-workspace--child-frames)))
+      (let ((id (car entry))
+            (frame (exwm-workspace--frame-by-outer-id (car entry))))
+        (cond
+         ((not (frame-live-p frame))
+          (setq exwm-workspace--child-frames
+                (assq-delete-all id exwm-workspace--child-frames)))
+         ((exwm-workspace--child-frame-hidden-p frame)
+          (unless (and (= (nth 1 entry) exwm-workspace--child-frame-park)
+                       (= (nth 2 entry) exwm-workspace--child-frame-park))
+            (exwm-workspace--child-frame-note
+             id exwm-workspace--child-frame-park
+             exwm-workspace--child-frame-park
+             (nth 3 entry) (nth 4 entry))
+            (exwm-workspace--move-child-frame
+             id exwm-workspace--child-frame-park
+             exwm-workspace--child-frame-park)))
+         (t
+          (let* ((parent (frame-parameter frame 'parent-frame))
+                 (origin (and (frame-live-p parent)
+                              (exwm-workspace--frame-native-origin parent)))
+                 (rel-x (nth 3 entry))
+                 (rel-y (nth 4 entry))
+                 (abs-x (if origin
+                            (+ rel-x (car origin))
+                          (nth 1 entry)))
+                 (abs-y (if origin
+                            (+ rel-y (cdr origin))
+                          (nth 2 entry))))
+            (exwm-workspace--child-frame-note id abs-x abs-y rel-x rel-y)
+            (exwm-workspace--move-child-frame id abs-x abs-y t))))))
+    (xcb:flush exwm--connection)))
+
+(defun exwm-workspace--restore-child-frames ()
+  "Put promoted child frames back under their parent frames."
+  (when (and exwm--connection
+             (slot-value exwm--connection 'connected))
+    (dolist (entry exwm-workspace--child-frames)
+      (let ((frame (exwm-workspace--frame-by-outer-id (car entry))))
+        (when (frame-live-p frame)
+          (let* ((parent (frame-parameter frame 'parent-frame))
+                 (parent-id (and (frame-live-p parent)
+                                 (frame-parameter parent 'window-id))))
+            (when (stringp parent-id)
+              (xcb:+request exwm--connection
+                  (make-instance 'xcb:ReparentWindow
+                                 :window (car entry)
+                                 :parent (string-to-number parent-id)
+                                 :x (nth 3 entry)
+                                 :y (nth 4 entry))))))))
+    (xcb:flush exwm--connection))
+  (setq exwm-workspace--child-frames nil))
+
+(defun exwm-workspace--on-child-frame-configure (window x y)
+  "Correct a promoted child frame after Emacs moves window WINDOW.
+X and Y are the ConfigureNotify coordinates."
+  (let ((entry (assq window exwm-workspace--child-frames)))
+    (when (and entry
+               (not (and (numberp (nth 1 entry)) (numberp (nth 2 entry))
+                         (= x (nth 1 entry)) (= y (nth 2 entry)))))
+      (let* ((frame (exwm-workspace--frame-by-outer-id window))
+             (parent (and (frame-live-p frame)
+                          (frame-parameter frame 'parent-frame)))
+             (origin (and (frame-live-p parent)
+                          (exwm-workspace--frame-native-origin parent)))
+             (hidden (and (frame-live-p frame)
+                          (exwm-workspace--child-frame-hidden-p frame)))
+             (target (exwm-workspace--child-frame-target
+                      x y (nth 1 entry) (nth 2 entry)
+                      (and origin (car origin))
+                      (and origin (cdr origin))
+                      hidden)))
+        (when target
+          ;; A park echo must not replace the parent-relative position.
+          ;; Any other event is the position Emacs asked for.
+          (let ((rel-x x)
+                (rel-y y))
+            (when (and hidden
+                       (= x exwm-workspace--child-frame-park)
+                       (= y exwm-workspace--child-frame-park))
+              (setq rel-x (nth 3 entry)
+                    rel-y (nth 4 entry)))
+            (exwm-workspace--child-frame-note
+             window (car target) (cdr target) rel-x rel-y))
+          (unless (and (= (car target) x) (= (cdr target) y))
+            (exwm-workspace--move-child-frame
+             window (car target) (cdr target) t)
+            (xcb:flush exwm--connection)))))))
+
+(defun exwm-workspace--on-ReparentNotify (data _synthetic)
+  "Keep a promoted child frame a child of the root.
+DATA contains unmarshalled ReparentNotify event data.
+Emacs or GTK can reparent the frame back under its parent.  Put it
+back on the root.  A frame corrected once stays on the guard list
+until the next timer, so a client that reparents it again cannot
+ping-pong inside one event batch."
+  (with-slots (window parent)
+      (xcb:unmarshal-new 'xcb:ReparentNotify data)
+    (when (and (assq window exwm-workspace--child-frames)
+               (not (eq parent exwm--root))
+               (not (memq window exwm-workspace--child-frame-reparent-guard)))
+      (let ((entry (assq window exwm-workspace--child-frames)))
+        (push window exwm-workspace--child-frame-reparent-guard)
+        (run-at-time 0 nil
+                     (lambda (id)
+                       (setq exwm-workspace--child-frame-reparent-guard
+                             (delq id exwm-workspace--child-frame-reparent-guard)))
+                     window)
+        (exwm--log "child-frame #x%x reparented away from root" window)
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:ReparentWindow
+                           :window window
+                           :parent exwm--root
+                           :x (nth 1 entry)
+                           :y (nth 2 entry)))
+        (exwm-workspace--move-child-frame
+         window (nth 1 entry) (nth 2 entry) t)
+        (xcb:flush exwm--connection)))))
+
+(defun exwm-workspace--add-frame-listener ()
+  "Listen for ConfigureNotify and ReparentNotify once.
+The minibuffer frame registers this when it exists.  Otherwise
+`exwm-workspace--init' does.  A second call does not add another
+listener: `xcb:+event' appends, and two listeners would run twice."
+  (unless exwm-workspace--frame-listener
+    (xcb:+event exwm--connection 'xcb:ConfigureNotify
+                #'exwm-workspace--on-ConfigureNotify)
+    (xcb:+event exwm--connection 'xcb:ReparentNotify
+                #'exwm-workspace--on-ReparentNotify)
+    (setq exwm-workspace--frame-listener t)))
+
 (defun exwm-workspace--on-ConfigureNotify (data _synthetic)
-  "Adjust the container to fit the minibuffer frame.
+  "Adjust the minibuffer container, or correct a promoted child frame.
 DATA contains unmarshalled ConfigureNotify event data."
-  (with-slots (window height)
+  (with-slots (window x y height)
       (xcb:unmarshal-new 'xcb:ConfigureNotify data)
-    (when (eq (frame-parameter exwm-workspace--minibuffer 'exwm-outer-id)
-              window)
+    (cond
+     ((eq (frame-parameter exwm-workspace--minibuffer 'exwm-outer-id)
+          window)
       (exwm--log)
       (when (and (floatp max-mini-window-height)
                  (> height (* max-mini-window-height
@@ -1178,7 +1526,9 @@ DATA contains unmarshalled ConfigureNotify event data."
                                                xcb:ConfigWindow:Height)
                            :y y
                            :height height))
-        (xcb:flush exwm--connection)))))
+        (xcb:flush exwm--connection)))
+     ((assq window exwm-workspace--child-frames)
+      (exwm-workspace--on-child-frame-configure window x y)))))
 
 (defun exwm-workspace--display-buffer (buffer alist)
   "Display BUFFER as if the current workspace were selected.
@@ -1484,6 +1834,7 @@ When QUIT is non-nil cleanup avoid communicating with the X server."
   "Hook run upon `delete-frame' removing FRAME as a workspace."
   (cond
    ((not (exwm-workspace--workspace-p frame))
+    (exwm-workspace--forget-child-frame frame)
     (exwm--log "Frame `%s' is not a workspace" frame))
    (t
     (exwm-workspace--remove-frame-as-workspace frame))))
@@ -1516,6 +1867,12 @@ Called from a timer."
                frame
                (frame-parameter frame 'display)
                (slot-value exwm--connection 'display)))
+   ((frame-live-p (frame-parameter frame 'parent-frame))
+    ;; A child frame is not a workspace.  posframe binds
+    ;; `after-make-frame-functions' to nil, so `x-create-frame' promotes
+    ;; those; this clause still covers a child frame that is not
+    ;; unsplittable.
+    (exwm-workspace--promote-child-frame frame))
    ((frame-parameter frame 'unsplittable)
     ;; We create floating frames with the "unsplittable" parameter set.
     ;; Though it may not be a floating frame, we won't treat an
@@ -1626,8 +1983,7 @@ applied to all subsequently created X frames."
                        :window outer-id
                        :value-mask xcb:CW:EventMask
                        :event-mask xcb:EventMask:StructureNotify))
-    (xcb:+event exwm--connection 'xcb:ConfigureNotify
-                #'exwm-workspace--on-ConfigureNotify))
+    (exwm-workspace--add-frame-listener))
   ;; Show/hide minibuffer / echo area when they're active/inactive.
   (add-hook 'minibuffer-setup-hook #'exwm-workspace--on-minibuffer-setup)
   (add-hook 'minibuffer-exit-hook #'exwm-workspace--on-minibuffer-exit)
@@ -1706,6 +2062,9 @@ applied to all subsequently created X frames."
     (let ((exwm-workspace--create-silently t))
       (dolist (i initial-workspaces)
         (exwm-workspace--add-frame-as-workspace i))))
+  ;; The minibuffer frame registers this when it has its own frame.
+  ;; Register here too so a child frame is corrected either way.
+  (exwm-workspace--add-frame-listener)
   (xcb:flush exwm--connection)
   ;; We have to advice `x-create-frame' or every call to it would hang EXWM
   (advice-add 'x-create-frame :around #'exwm-workspace--x-create-frame)
@@ -1746,7 +2105,10 @@ applied to all subsequently created X frames."
                  #'exwm-workspace--on-echo-area-clear))
   ;; Hide & reparent out all frames (save-set can't be used here since
   ;; X windows will be re-mapped).
+  (setq exwm-workspace--frame-listener nil
+        exwm-workspace--child-frame-reparent-guard nil)
   (when (slot-value exwm--connection 'connected)
+    (exwm-workspace--restore-child-frames)
     (dolist (i exwm-workspace--list)
       (when (frame-live-p i)                    ; might be already dead
         (exwm-workspace--remove-frame-as-workspace i 'quit)
@@ -1757,6 +2119,7 @@ applied to all subsequently created X frames."
                                      (exwm-container . nil)
                                      (fullscreen . nil)
                                      (buffer-predicate . nil))))))
+  (setq exwm-workspace--child-frames nil)
   ;; Don't let dead frames linger.
   (setq exwm-workspace--current nil)
   (setq exwm-workspace-current-index 0)
