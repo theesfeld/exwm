@@ -583,7 +583,11 @@ DATA contains unmarshalled PropertyNotify event data."
   "Handle _NET_ACTIVE_WINDOW message with ID."
   (let ((buffer (exwm--id->buffer id))
         window)
-    (if (buffer-live-p buffer)
+    (if (and (buffer-live-p buffer)
+             (plist-get (buffer-local-value 'exwm--configurations buffer)
+                        'dont-steal-focus))
+        (exwm--log "Ignoring focus request from #x%x" id)
+      (if (buffer-live-p buffer)
         ;; Either an `exwm-mode' buffer (an X window) or a floating frame.
         (with-current-buffer buffer
           (when (eq exwm--frame exwm-workspace--current)
@@ -599,7 +603,7 @@ DATA contains unmarshalled PropertyNotify event data."
       ;; A workspace.
       (dolist (f exwm-workspace--list)
         (when (eq id (frame-parameter f 'exwm-outer-id))
-          (x-focus-frame f t))))))
+          (x-focus-frame f t)))))))
 
 (defun exwm--on-net-close-window (id _data)
   "Handle _NET_CLOSE_WINDOW message with ID."

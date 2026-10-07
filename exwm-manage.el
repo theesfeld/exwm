@@ -66,6 +66,7 @@ possible choices:
 * simulation-keys: `exwm-input-simulation-keys' local to this X window.
 * workspace: The initial workspace.
 * managed: Force to manage (non-nil) or not manage (nil) the X window.
+* dont-steal-focus: Non-nil ignores `_NET_ACTIVE_WINDOW' from this X window.
 
 For each X window managed for the first time, matching criteria (sexps) are
 evaluated sequentially and the first configuration with a non-nil matching
@@ -99,6 +100,8 @@ want to match against EXWM internal variables such as `exwm-title',
                                 :value-type (key-sequence :tag "To")))
                         ((const :tag "Workspace" workspace) integer)
                         ((const :tag "Managed" managed) boolean)
+                        ((const :tag "Don't steal focus" dont-steal-focus)
+                         boolean)
                         ;; For forward compatibility.
                         ((other) sexp))))
   ;; TODO: This is admittedly ugly.  We'd be better off with an event type.
