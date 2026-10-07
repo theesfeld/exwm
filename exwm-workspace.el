@@ -187,6 +187,8 @@ Stops a client that immediately reparents the frame back from looping.")
 (declare-function exwm-layout--refresh "exwm-layout.el")
 (declare-function exwm-layout--show "exwm-layout.el" (id &optional window))
 (declare-function exwm-layout--raise-fullscreen "exwm-layout.el" (frame))
+(declare-function exwm-layout--iconic-state-p "exwm-layout.el"
+                  (&optional id))
 
 (defsubst exwm-workspace--position (frame)
   "Retrieve index of given FRAME in workspace list.
@@ -474,6 +476,13 @@ ACTIVE indicates whether to set the frame active or inactive."
   "Return non-nil if FRAME is active."
   (frame-parameter frame 'exwm-active))
 
+(defun exwm-workspace--iconic-window-p (window)
+  "Return non-nil if WINDOW is showing a minimized X client."
+  (and (window-live-p window)
+       (with-current-buffer (window-buffer window)
+         (and (derived-mode-p 'exwm-mode)
+              (exwm-layout--iconic-state-p)))))
+
 (defun exwm-workspace--set-fullscreen (frame)
   "Make frame FRAME fullscreen according to `exwm-workspace--workareas'."
   (exwm--log "frame=%s" frame)
@@ -619,6 +628,11 @@ When FORCE is true, allow switching to current workspace."
       (setq switched t)
       (unless (window-live-p window)
         (setq window (frame-selected-window frame)))
+      ;; A minimized client stays minimized across a workspace switch.
+      (when (exwm-workspace--iconic-window-p window)
+        (setq window (or (cl-find-if-not #'exwm-workspace--iconic-window-p
+                                         (window-list frame 'nomini))
+                         window)))
     (when (and (not (eq frame old-frame))
                (frame-live-p old-frame))
       (setq exwm-workspace--previous old-frame)
@@ -668,7 +682,8 @@ When FORCE is true, allow switching to current workspace."
                 (exwm-layout--hide exwm--id)
               (when (eq frame exwm--frame)
                 (let ((window (get-buffer-window nil t)))
-                  (when window
+                  (when (and window
+                             (not (exwm-layout--iconic-state-p)))
                     (exwm-layout--show exwm--id window))))))))
       ;; A fullscreen client was mapped before its siblings.  Raise it
       ;; after them, then raise child frames again so a popup stays
