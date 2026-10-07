@@ -1761,9 +1761,11 @@ ALIST is an action alist, as accepted by function `display-buffer'."
     (run-hooks 'exwm-workspace-list-change-hook)))
 
 (defun exwm-workspace--get-next-workspace (frame &optional allow-active)
-  "Return the next workspace if workspace FRAME were removed.
-Return nil there are no other worksapces or ALLOW-ACTIVE is non-nil and
-all other workspaces are currently visible on other monitors."
+  "Return the workspace that replaces FRAME.
+Search later workspaces first, then earlier ones.  Skip FRAME.
+When ALLOW-ACTIVE is nil, return only a workspace that is not active.
+When ALLOW-ACTIVE is non-nil, an active workspace is acceptable.
+Return nil when no such workspace exists."
   (let* ((index (exwm-workspace--position frame))
          (count (exwm-workspace--count)))
     (or
@@ -1771,13 +1773,13 @@ all other workspaces are currently visible on other monitors."
               for nextw = (elt exwm-workspace--list i)
               when (and (not (eq frame nextw))
                         (or allow-active
-                            (exwm-workspace--active-p nextw)))
+                            (not (exwm-workspace--active-p nextw))))
               return nextw)
      (cl-loop for i from (1- index) downto 0
               for nextw = (elt exwm-workspace--list i)
               when (and (not (eq frame nextw))
                         (or allow-active
-                            (exwm-workspace--active-p nextw)))
+                            (not (exwm-workspace--active-p nextw))))
               return nextw))))
 
 (defun exwm-workspace--remove-frame-as-workspace (frame &optional quit)
@@ -1787,7 +1789,8 @@ When QUIT is non-nil cleanup avoid communicating with the X server."
   ;; etc)
   (exwm--log "Removing frame `%s' as workspace" frame)
   (unless quit
-    (let* ((next-frame (exwm-workspace--get-next-workspace frame))
+    (let* ((next-frame (exwm-workspace--get-next-workspace
+                        frame (not (exwm-workspace--active-p frame))))
            (following-frames (cdr (memq frame exwm-workspace--list))))
       ;; Need to remove the workspace from the list for the correct calculation of
       ;; indexes below.
