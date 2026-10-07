@@ -904,6 +904,21 @@ INDEX must not exceed the current number of workspaces."
                          :window id
                          :data desktop)))))
 
+(defun exwm-workspace--set-window-buffer (frame buffer)
+  "Show BUFFER in an undedicated window of FRAME.
+Signal a `user-error' when every window on FRAME is dedicated."
+  (let* ((selected (frame-selected-window frame))
+         (window (if (and (window-live-p selected)
+                          (not (window-dedicated-p selected)))
+                     selected
+                   (cl-find-if-not #'window-dedicated-p
+                                   (window-list frame 'nomini)))))
+    (unless (and (window-live-p window)
+                 (not (window-dedicated-p window)))
+      (user-error "[EXWM] No undedicated window on that workspace"))
+    (set-window-buffer window buffer)
+    window))
+
 (cl-defun exwm-workspace-move-window (frame-or-index &optional id)
   "Move window ID to workspace FRAME-OR-INDEX."
   (interactive (list
@@ -942,12 +957,12 @@ INDEX must not exceed the current number of workspaces."
               (unless (eq frame exwm-workspace--current)
                 ;; Clear the 'exwm-selected-window' frame parameter.
                 (set-frame-parameter frame 'exwm-selected-window nil))
-              (set-window-buffer (frame-selected-window frame)
-                                 (exwm--id->buffer id))
-              (if (eq frame exwm-workspace--current)
-                  (select-window (frame-selected-window frame))
-                (unless (exwm-workspace--active-p frame)
-                  (exwm-layout--hide id))))
+              (let ((placed (exwm-workspace--set-window-buffer
+                             frame (current-buffer))))
+                (if (eq frame exwm-workspace--current)
+                    (select-window placed)
+                  (unless (exwm-workspace--active-p frame)
+                    (exwm-layout--hide id)))))
           ;; Floating.
           (setq container (frame-parameter exwm--floating-frame
                                            'exwm-container))
@@ -1091,8 +1106,10 @@ INDEX must not exceed the current number of workspaces."
                 (if window
                     (set-frame-parameter exwm--frame
                                          'exwm-selected-window window)
-                  (set-window-buffer (frame-selected-window exwm--frame)
-                                     buffer-or-name)))
+                  (set-frame-parameter
+                   exwm--frame 'exwm-selected-window
+                   (exwm-workspace--set-window-buffer
+                    exwm--frame buffer-or-name))))
               (exwm-workspace-switch exwm--frame)))
         ;; Ordinary buffer.
         (switch-to-buffer buffer-or-name)))))
