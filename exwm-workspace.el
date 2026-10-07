@@ -1374,8 +1374,8 @@ ALIST is an action alist, as accepted by function `display-buffer'."
       (setq exwm-workspace--switch-history-outdated t)
     (let ((original-index exwm-workspace-current-index))
       (exwm-workspace-switch frame t)
-      (message "Created %s as workspace %d; switched from %d"
-               frame exwm-workspace-current-index original-index))
+      (message "EXWM switched to new workspace %d (from workspace %d)"
+               exwm-workspace-current-index original-index))
     (run-hooks 'exwm-workspace-list-change-hook)))
 
 (defun exwm-workspace--get-next-workspace (frame &optional allow-active)
