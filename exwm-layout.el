@@ -267,10 +267,13 @@ that choice is in effect."
   (when (called-interactively-p 'any)
     (setq user t))
   (exwm--log "id=#x%x" (or id 0))
-  (unless (and (or id (derived-mode-p 'exwm-mode))
-               (not (exwm-layout--fullscreen-p)))
+  (unless (or id (derived-mode-p 'exwm-mode))
     (cl-return-from exwm-layout-set-fullscreen))
   (with-current-buffer (if id (exwm--id->buffer id) (window-buffer))
+    ;; Fullscreen is a property of this buffer.  The selected buffer
+    ;; may be a different one when ID is given.
+    (when (exwm-layout--fullscreen-p)
+      (cl-return-from exwm-layout-set-fullscreen))
     (when (and exwm--fullscreen-hold (not user))
       (cl-return-from exwm-layout-set-fullscreen))
     (setq exwm--fullscreen-hold nil)
@@ -304,10 +307,13 @@ ignored until the user enters fullscreen again."
   (when (called-interactively-p 'any)
     (setq user t))
   (exwm--log "id=#x%x" (or id 0))
-  (unless (and (or id (derived-mode-p 'exwm-mode))
-               (exwm-layout--fullscreen-p))
+  (unless (or id (derived-mode-p 'exwm-mode))
     (cl-return-from exwm-layout-unset-fullscreen))
   (with-current-buffer (if id (exwm--id->buffer id) (window-buffer))
+    ;; The selected buffer is not the target when ID names another
+    ;; X window.  Leave a window that is not fullscreen alone.
+    (unless (exwm-layout--fullscreen-p)
+      (cl-return-from exwm-layout-unset-fullscreen))
     (when user
       (setq exwm--fullscreen-hold t))
     ;; `exwm-layout--show' relies on `exwm--ewmh-state' to decide whether to
