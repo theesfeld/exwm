@@ -58,6 +58,41 @@ switch, add, delete, move, swap, or rename."
   :initialize #'custom-initialize-default
   :set #'exwm-workspace--set-mode-line)
 
+(defcustom exwm-workspace-strip nil
+  "When non-nil, workspaces on one monitor form a strip.
+`exwm-workspace-strip-left' and `exwm-workspace-strip-right' move
+along that strip and do not wrap.  Add, close, and reorder then
+act on the current monitor.  Nil leaves those commands on the
+global list.  The global list and EWMH desktop indexes stay either
+way, so existing index commands and a pager keep working.
+
+Order is the frame parameter `exwm-workspace-strip-order', so
+reordering one monitor does not reshuffle another.  A workspace
+with no monitor stays in the global list.  Hotplug keeps a
+workspace on a monitor that is still connected and keeps relative
+order.  `exwm-randr-workspace-monitor-plist' still wins for the
+index it names.
+
+While this is non-nil, `_NET_DESKTOP_NAMES' is \"MONITOR/NAME\"
+(or \"MONITOR\" when the workspace is unnamed) so a panel can
+group desktops by output.  The mode-line shows the monitor and
+the 1-based slot.  The overview uses one heading per output.
+No key is bound.
+
+Check on a live session: two workspaces on one output, left and
+right do not wrap, overview RET switches, show-desktop restores
+the same windows, and a second monitor keeps its order across a
+hotplug."
+  :type 'boolean
+  :initialize #'custom-initialize-default
+  :set #'exwm-workspace--set-strip)
+
+(defcustom exwm-workspace-overview-hook nil
+  "Abnormal hook run when the workspace overview opens or closes.
+Each function receives one argument: non-nil when the overview
+opens, nil when it closes."
+  :type 'hook)
+
 (defvar exwm-workspace-mode-line '(:eval (exwm-workspace--mode-line-text))
   "Mode-line construct for the current workspace.
 Put this in `mode-line-format' or `global-mode-string', or set
@@ -178,6 +213,28 @@ Stops a client that immediately reparents the frame back from looping.")
 
 (defvar exwm-workspace--prompt-delete-allowed nil
   "Non-nil to allow deleting workspace from the prompt.")
+
+(defvar exwm-workspace--strip-target-monitor nil
+  "Monitor name for a workspace being added to a strip.")
+
+(defvar exwm-workspace--strip-target-order nil
+  "Strip order for a workspace being added to a strip.")
+
+(defvar exwm-workspace--next-workspace nil
+  "Workspace that replaces one being removed, or nil.
+`exwm-workspace-strip-close' binds this so the replacement may be
+an active workspace on another monitor.")
+
+(defvar exwm-workspace--showing-desktop nil
+  "Non-nil while windows are hidden and the desktop is showing.")
+
+(defvar exwm-workspace--showing-desktop-geometry nil
+  "Alist of (WINDOW X Y WIDTH HEIGHT) saved by show-desktop.")
+
+(defvar exwm-workspace--showing-desktop-clients nil
+  "X window ids unmapped by show-desktop.")
+
+(defvar exwm-layout--floating-hidden-position)
 
 (defvar exwm-workspace--struts nil "Areas occupied by struts.")
 
@@ -483,7 +540,9 @@ ACTIVE indicates whether to set the frame active or inactive."
   ;; before child frames are raised, so a popup follows its frame
   ;; rather than the parked position.  Shrinking the workspace
   ;; container below does not hide either of them.
-  (exwm-floating--sync-workspace frame active)
+  (exwm-floating--sync-workspace frame
+                                 (and active
+                                      (not exwm-workspace--showing-desktop)))
   (if active
       (exwm-workspace--set-fullscreen frame)
     (exwm--set-geometry (frame-parameter frame 'exwm-container) nil nil 1 1))
@@ -513,9 +572,16 @@ ACTIVE indicates whether to set the frame active or inactive."
       (when (and (eq frame exwm-workspace--current)
                  (exwm-workspace--minibuffer-own-frame-p))
         (exwm-workspace--resize-minibuffer-frame))
-      (if (exwm-workspace--active-p frame)
-          (exwm--set-geometry container x y width height)
-        (exwm--set-geometry container x y 1 1))
+      (cond
+       (exwm-workspace--showing-desktop
+        (exwm--set-geometry container
+                            exwm-layout--floating-hidden-position
+                            exwm-layout--floating-hidden-position
+                            1 1))
+       ((exwm-workspace--active-p frame)
+        (exwm--set-geometry container x y width height))
+       (t
+        (exwm--set-geometry container x y 1 1)))
       (exwm--set-geometry id nil nil width height)
       (xcb:flush exwm--connection)))
   ;; The workspace moved or resized.  Child frames are on the root, so
@@ -638,6 +704,8 @@ When FORCE is true, allow switching to current workspace."
       current-prefix-arg)
      (t 0))))
   (exwm--log)
+  (when exwm-workspace--showing-desktop
+    (exwm-workspace--restore-desktop))
   (let* ((frame (exwm-workspace--workspace-from-frame-or-index frame-or-index))
          (old-frame exwm-workspace--current)
          (index (exwm-workspace--position frame))
@@ -959,7 +1027,11 @@ workspace is urgent."
     (let ((names nil)
           (flags nil))
       (dolist (frame exwm-workspace--list)
-        (push (frame-parameter frame 'exwm-workspace-name) names)
+        (push (exwm-workspace--published-name
+               (frame-parameter frame 'exwm-randr-monitor)
+               (frame-parameter frame 'exwm-workspace-name)
+               exwm-workspace-strip)
+              names)
         (push (and (frame-parameter frame 'exwm-urgency) t) flags))
       (setq names (nreverse names)
             flags (nreverse flags))
@@ -1020,6 +1092,609 @@ urgency sets the same frame parameter."
     (set-frame-parameter frame 'exwm-urgency t)
     (exwm-workspace--publish-desktops)))
 
+(defun exwm-workspace--order-before-p (order-a index-a order-b index-b)
+  "Non-nil when ORDER-A at INDEX-A precedes ORDER-B at INDEX-B.
+A number precedes nil.  Equal numbers keep the smaller index."
+  (cond
+   ((and (numberp order-a) (numberp order-b))
+    (or (< order-a order-b)
+        (and (= order-a order-b) (< index-a index-b))))
+   ((numberp order-a) t)
+   ((numberp order-b) nil)
+   (t (< index-a index-b))))
+
+(defun exwm-workspace--strip-groups (entries strip)
+  "Group ENTRIES into strips.
+Each entry is (ID MONITOR ORDER), in global order.  When STRIP
+is nil, return one group (nil ID...).  Otherwise return
+((MONITOR ID...) ...) in the order monitors first appear.  IDs
+in a group follow strip order.  A nil monitor is its own group."
+  (if (not strip)
+      (list (cons nil (mapcar #'car entries)))
+    (let (seen groups)
+      (dolist (entry entries)
+        (let ((monitor (nth 1 entry)))
+          (unless (assoc monitor groups)
+            (push monitor seen)
+            (push (list monitor) groups))))
+      (setq seen (nreverse seen))
+      (let ((index 0))
+        (dolist (entry entries)
+          (let ((bucket (assoc (nth 1 entry) groups)))
+            (push (cons index entry) (cdr bucket)))
+          (setq index (1+ index))))
+      (mapcar
+       (lambda (monitor)
+         (let* ((bucket (assoc monitor groups))
+                (items (nreverse (cdr bucket))))
+           (cons monitor
+                 (mapcar (lambda (item) (car (cdr item)))
+                         (sort items
+                               (lambda (a b)
+                                 (exwm-workspace--order-before-p
+                                  (nth 2 (cdr a)) (car a)
+                                  (nth 2 (cdr b)) (car b))))))))
+       seen))))
+
+(defun exwm-workspace--strip-group (entries id strip)
+  "Return the group in ENTRIES that contains ID, or nil."
+  (cl-find-if (lambda (group) (memq id (cdr group)))
+              (exwm-workspace--strip-groups entries strip)))
+
+(defun exwm-workspace--strip-neighbor (entries id strip direction)
+  "Return the neighbor of ID, or nil.
+DIRECTION is -1 or 1.  Neighbors do not wrap."
+  (let* ((group (exwm-workspace--strip-group entries id strip))
+         (ids (and group (cdr group)))
+         (pos (and ids (cl-position id ids)))
+         (next (and pos (+ pos direction))))
+    (when (and next (>= next 0) (< next (length ids)))
+      (nth next ids))))
+
+(defun exwm-workspace--strip-slot (entries id strip)
+  "Return the 1-based slot of ID, or nil."
+  (let* ((group (exwm-workspace--strip-group entries id strip))
+         (pos (and group (cl-position id (cdr group)))))
+    (and pos (1+ pos))))
+
+(defun exwm-workspace--strip-select-id (entries id strip slot)
+  "Return the id at 1-based SLOT in ID's group, or nil."
+  (when (and (integerp slot) (> slot 0))
+    (let ((group (exwm-workspace--strip-group entries id strip)))
+      (and group (nth (1- slot) (cdr group))))))
+
+(defun exwm-workspace--strip-close-target (entries id strip)
+  "Return the workspace that replaces ID, or nil to refuse.
+Nil means ID is the only workspace.  Otherwise prefer the right
+neighbor, then the left, then the first workspace of another
+group."
+  (when (> (length entries) 1)
+    (or (exwm-workspace--strip-neighbor entries id strip 1)
+        (exwm-workspace--strip-neighbor entries id strip -1)
+        (let ((groups (exwm-workspace--strip-groups entries strip)))
+          (cl-loop for group in groups
+                   unless (memq id (cdr group))
+                   return (cadr group))))))
+
+(defun exwm-workspace--strip-moved-orders (entries id direction)
+  "Return ((ID . ORDER) ...) after moving ID, or nil.
+DIRECTION is -1 or 1.  Only ID's monitor is rewritten, as 0..n-1
+in the new order.  There is no wrap."
+  (let ((group (exwm-workspace--strip-group entries id t)))
+    (when group
+      (let* ((ids (copy-sequence (cdr group)))
+             (pos (cl-position id ids))
+             (next (and pos (+ pos direction))))
+        (when (and next (>= next 0) (< next (length ids)))
+          (let ((other (nth next ids)))
+            (setf (nth next ids) id
+                  (nth pos ids) other)
+            (cl-loop for frame in ids
+                     for order from 0
+                     collect (cons frame order))))))))
+
+(defun exwm-workspace--strip-insert (entries id)
+  "Return (NEW-ORDER . ((ID . ORDER) ...)) for a frame right of ID.
+The alist is ID's monitor after the insert, without the new frame.
+NEW-ORDER is nil when ID is not in ENTRIES."
+  (let* ((group (exwm-workspace--strip-group entries id t))
+         (ids (and group (cdr group)))
+         (pos (and ids (cl-position id ids))))
+    (if (not pos)
+        (cons nil nil)
+      (cons (1+ pos)
+            (cl-loop for frame in ids
+                     for i from 0
+                     collect (cons frame (if (<= i pos) i (1+ i))))))))
+
+(defun exwm-workspace--strip-rebuild-before (a b)
+  "Sort predicate for `exwm-workspace--strip-rebuild' items."
+  (exwm-workspace--order-before-p
+   (nth 3 (cdr a)) (car a)
+   (nth 3 (cdr b)) (car b)))
+
+(defun exwm-workspace--strip-rebuild (entries)
+  "Return ((ID . ORDER) ...) after monitors change.
+ENTRIES are (ID NEW-MONITOR OLD-MONITOR ORDER) in global order.
+Within one new monitor, frames that were already there come
+first, in strip order.  Frames that moved onto it follow, in
+their old strip order."
+  (let (seen groups)
+    (dolist (entry entries)
+      (let ((monitor (nth 1 entry)))
+        (unless (assoc monitor groups)
+          (push monitor seen)
+          (push (list monitor nil nil) groups))))
+    (setq seen (nreverse seen))
+    (let ((index 0))
+      (dolist (entry entries)
+        (let ((cell (assoc (nth 1 entry) groups)))
+          (if (equal (nth 1 entry) (nth 2 entry))
+              (push (cons index entry) (nth 1 cell))
+            (push (cons index entry) (nth 2 cell))))
+        (setq index (1+ index))))
+    (let (result)
+      (dolist (monitor seen)
+        (let* ((cell (assoc monitor groups))
+               (ordered (append
+                         (sort (nreverse (nth 1 cell))
+                               #'exwm-workspace--strip-rebuild-before)
+                         (sort (nreverse (nth 2 cell))
+                               #'exwm-workspace--strip-rebuild-before)))
+               (n 0))
+          (dolist (item ordered)
+            (push (cons (car (cdr item)) n) result)
+            (setq n (1+ n)))))
+      (nreverse result))))
+
+(defun exwm-workspace--strip-note-orders (alist)
+  "Store ALIST of (FRAME . ORDER) as `exwm-workspace-strip-order'."
+  (dolist (cell alist)
+    (when (frame-live-p (car cell))
+      (set-frame-parameter (car cell) 'exwm-workspace-strip-order
+                           (cdr cell)))))
+
+(defun exwm-workspace--strip-entries ()
+  "Return (FRAME MONITOR ORDER) for each workspace, in global order."
+  (mapcar (lambda (frame)
+            (list frame
+                  (frame-parameter frame 'exwm-randr-monitor)
+                  (frame-parameter frame 'exwm-workspace-strip-order)))
+          exwm-workspace--list))
+
+(defun exwm-workspace--published-name (monitor name strip)
+  "Return the _NET_DESKTOP_NAMES field for MONITOR and NAME.
+When STRIP is non-nil and MONITOR is a non-empty string, prefix
+MONITOR and a slash.  An empty NAME publishes MONITOR alone, or
+\"\" when STRIP is nil."
+  (let ((clean (if (and (stringp name) (not (string-empty-p name)))
+                   (string-replace "\0" "" (substring-no-properties name))
+                 "")))
+    (if (and strip (stringp monitor) (not (string-empty-p monitor)))
+        (let ((mon (string-replace "\0" "" monitor)))
+          (if (string-empty-p clean)
+              mon
+            (concat mon "/" clean)))
+      clean)))
+
+(defun exwm-workspace--format-strip-label (monitor slot name urgent)
+  "Return a strip label for MONITOR, 1-based SLOT, NAME, and URGENT."
+  (let ((body (if (and (stringp name) (not (string-empty-p name)))
+                  (format "%d:%s" slot name)
+                (format "%d" slot))))
+    (when (and (stringp monitor) (not (string-empty-p monitor)))
+      (setq body (format "%s %s" monitor body)))
+    (if urgent
+        (concat body "!")
+      body)))
+
+(defun exwm-workspace--set-strip (symbol value)
+  "Set SYMBOL to VALUE and refresh strip order and desktop names."
+  (set-default symbol value)
+  (when (and value exwm-workspace--list)
+    (exwm-workspace--strip-note-orders
+     (exwm-workspace--strip-rebuild
+      (mapcar (lambda (frame)
+                (list frame
+                      (frame-parameter frame 'exwm-randr-monitor)
+                      (frame-parameter frame 'exwm-randr-monitor)
+                      (frame-parameter frame 'exwm-workspace-strip-order)))
+              exwm-workspace--list))))
+  (when exwm--connection
+    (exwm-workspace--publish-desktops))
+  (force-mode-line-update t))
+
+(defun exwm-workspace--strip-go (direction)
+  "Switch DIRECTION workspaces along the current strip.  Do not wrap."
+  (let ((frame exwm-workspace--current))
+    (unless (and frame (exwm-workspace--workspace-p frame))
+      (user-error "[EXWM] No workspace"))
+    (let ((next (exwm-workspace--strip-neighbor
+                 (exwm-workspace--strip-entries)
+                 frame exwm-workspace-strip direction)))
+      (unless next
+        (user-error "[EXWM] No workspace in that direction"))
+      (exwm-workspace-switch next))))
+
+(defun exwm-workspace-strip-left ()
+  "Switch to the previous workspace on this monitor.
+Does not wrap.  With `exwm-workspace-strip' nil, move along the
+global list instead."
+  (interactive)
+  (exwm-workspace--strip-go -1))
+
+(defun exwm-workspace-strip-right ()
+  "Switch to the next workspace on this monitor.
+Does not wrap.  With `exwm-workspace-strip' nil, move along the
+global list instead."
+  (interactive)
+  (exwm-workspace--strip-go 1))
+
+(defun exwm-workspace-strip-add ()
+  "Add a workspace to the right of the current one and switch to it.
+With `exwm-workspace-strip' non-nil the new workspace stays on
+this monitor.  Otherwise it is inserted in the global list."
+  (interactive)
+  (let ((frame exwm-workspace--current))
+    (unless (and frame (exwm-workspace--workspace-p frame))
+      (user-error "[EXWM] No workspace"))
+    (if (not exwm-workspace-strip)
+        (exwm-workspace-add (1+ (or (exwm-workspace--position frame) 0)))
+      (let* ((entries (exwm-workspace--strip-entries))
+             (spec (exwm-workspace--strip-insert entries frame))
+             (monitor (frame-parameter frame 'exwm-randr-monitor)))
+        (dolist (cell (cdr spec))
+          (when (frame-live-p (car cell))
+            (set-frame-parameter (car cell) 'exwm-workspace-strip-order
+                                 (cdr cell))))
+        (let ((exwm-workspace--strip-target-monitor monitor)
+              (exwm-workspace--strip-target-order (car spec)))
+          (make-frame))))))
+
+(defun exwm-workspace-strip-close ()
+  "Delete the current workspace and select its neighbor.
+The right neighbor wins, then the left.  With strip mode on and
+no neighbor on this monitor, select a workspace on another
+monitor.  Refuse when this is the only workspace."
+  (interactive)
+  (let* ((frame exwm-workspace--current)
+         (target (exwm-workspace--strip-close-target
+                  (exwm-workspace--strip-entries)
+                  frame exwm-workspace-strip)))
+    (unless (and frame (exwm-workspace--workspace-p frame))
+      (user-error "[EXWM] No workspace"))
+    (unless target
+      (user-error "[EXWM] Refusing to delete the last workspace"))
+    (let ((exwm-workspace--next-workspace target))
+      (delete-frame frame))))
+
+(defun exwm-workspace--strip-reorder (direction)
+  "Move the current workspace DIRECTION slots.  Do not wrap."
+  (let ((frame exwm-workspace--current))
+    (unless (and frame (exwm-workspace--workspace-p frame))
+      (user-error "[EXWM] No workspace"))
+    (if (not exwm-workspace-strip)
+        (let ((other (exwm-workspace--strip-neighbor
+                      (exwm-workspace--strip-entries)
+                      frame nil direction)))
+          (unless other
+            (user-error "[EXWM] No workspace in that direction"))
+          (exwm-workspace-swap frame other))
+      (let ((orders (exwm-workspace--strip-moved-orders
+                     (exwm-workspace--strip-entries)
+                     frame direction)))
+        (unless orders
+          (user-error "[EXWM] No workspace in that direction"))
+        (dolist (cell orders)
+          (set-frame-parameter (car cell) 'exwm-workspace-strip-order
+                               (cdr cell)))
+        (exwm-workspace--publish-desktops)))))
+
+(defun exwm-workspace-strip-move-left ()
+  "Swap the current workspace with the previous one on this monitor.
+Does not wrap.  With `exwm-workspace-strip' nil, swap in the
+global list.  Other monitors stay put."
+  (interactive)
+  (exwm-workspace--strip-reorder -1))
+
+(defun exwm-workspace-strip-move-right ()
+  "Swap the current workspace with the next one on this monitor.
+Does not wrap.  With `exwm-workspace-strip' nil, swap in the
+global list.  Other monitors stay put."
+  (interactive)
+  (exwm-workspace--strip-reorder 1))
+
+(defun exwm-workspace-strip-select (slot)
+  "Switch to the 1-based SLOT on the current monitor.
+With `exwm-workspace-strip' nil, SLOT is the global position."
+  (interactive "nWorkspace slot: ")
+  (let* ((frame exwm-workspace--current)
+         (target (exwm-workspace--strip-select-id
+                  (exwm-workspace--strip-entries)
+                  frame exwm-workspace-strip slot)))
+    (unless target
+      (user-error "[EXWM] No workspace in slot %s" slot))
+    (exwm-workspace-switch target)))
+
+(defun exwm-workspace--overview-text (sections)
+  "Return overview text for SECTIONS.
+SECTIONS is a list of (HEADING ROW...).  ROW is
+(INDEX LABEL WINDOWS).  Workspace and window lines carry the
+text property `exwm-workspace-index'."
+  (if (null sections)
+      "No workspaces\n"
+    (let (parts)
+      (dolist (section sections)
+        (push (concat (car section) "\n") parts)
+        (dolist (row (cdr section))
+          (let ((index (nth 0 row))
+                (label (nth 1 row))
+                (windows (nth 2 row)))
+            (push (propertize (format "  %s\n" label)
+                              'exwm-workspace-index index)
+                  parts)
+            (if windows
+                (dolist (name windows)
+                  (push (propertize (format "      %s\n" name)
+                                    'exwm-workspace-index index)
+                        parts))
+              (push (propertize "      (empty)\n"
+                                'exwm-workspace-index index)
+                    parts)))))
+      (apply #'concat (nreverse parts)))))
+
+(defun exwm-workspace--buffer-label (buffer)
+  "Return BUFFER's name for the overview, or nil."
+  (when (buffer-live-p buffer)
+    (let ((name (buffer-name buffer)))
+      (when (and (stringp name) (not (string-empty-p name)))
+        (setq name (replace-regexp-in-string "\\` " "" name))
+        (unless (string-empty-p name)
+          name)))))
+
+(defun exwm-workspace--window-names (frame)
+  "Return window and X-client names shown on FRAME."
+  (when (frame-live-p frame)
+    (let (names)
+      (dolist (pair exwm--id-buffer-alist)
+        (when (eq (buffer-local-value 'exwm--frame (cdr pair)) frame)
+          (let ((name (exwm-workspace--buffer-label (cdr pair))))
+            (when (and name (not (member name names)))
+              (push name names)))))
+      (dolist (window (window-list frame 'nomini))
+        (let ((buffer (window-buffer window)))
+          (when (and (eq buffer (get-buffer "*EXWM Workspaces*"))
+                     (window-prev-buffers window))
+            (setq buffer (car (car (window-prev-buffers window)))))
+          (unless (and (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         (and (boundp 'exwm--id) exwm--id)))
+            (let ((name (exwm-workspace--buffer-label buffer)))
+              (when (and name
+                         (not (equal name "*EXWM Workspaces*"))
+                         (not (member name names)))
+                (push name names))))))
+      (nreverse names))))
+
+(defun exwm-workspace--overview-sections ()
+  "Return overview sections for the current workspaces."
+  (let* ((entries (exwm-workspace--strip-entries))
+         (groups (exwm-workspace--strip-groups entries exwm-workspace-strip)))
+    (mapcar
+     (lambda (group)
+       (cons (if exwm-workspace-strip
+                 (or (car group) "Unassigned")
+               "Workspaces")
+             (cl-loop for frame in (cdr group)
+                      for slot from 1
+                      for index = (or (exwm-workspace--position frame) 0)
+                      for name = (and (frame-live-p frame)
+                                      (frame-parameter frame 'exwm-workspace-name))
+                      for urgent = (and (frame-live-p frame)
+                                        (frame-parameter frame 'exwm-urgency))
+                      for label = (if exwm-workspace-strip
+                                      (exwm-workspace--format-strip-label
+                                       nil slot name urgent)
+                                    (exwm-workspace--format-label
+                                     index name urgent))
+                      collect (list index label
+                                    (exwm-workspace--window-names frame)))))
+     groups)))
+
+(defvar exwm-workspace--overview-noted nil
+  "Non-nil once this overview buffer has reported that it closed.")
+(make-variable-buffer-local 'exwm-workspace--overview-noted)
+
+(defun exwm-workspace--overview-note-close ()
+  "Run `exwm-workspace-overview-hook' once with nil."
+  (unless exwm-workspace--overview-noted
+    (setq exwm-workspace--overview-noted t)
+    (run-hook-with-args 'exwm-workspace-overview-hook nil)))
+
+(defvar-keymap exwm-workspace-overview-mode-map
+  :doc "Keymap for `exwm-workspace-overview-mode'."
+  "RET" #'exwm-workspace-overview-switch
+  "<mouse-1>" #'exwm-workspace-overview-switch
+  "q" #'exwm-workspace-overview-quit)
+
+(define-derived-mode exwm-workspace-overview-mode special-mode "EXWM-WS"
+  "Major mode for the EXWM workspace overview.
+RET or mouse-1 switches to the workspace at point and closes
+the overview.  `q' closes it."
+  (add-hook 'kill-buffer-hook #'exwm-workspace--overview-note-close nil t))
+
+(defun exwm-workspace--overview-show ()
+  "Pop the workspace overview and report that it opened."
+  (let ((buf (get-buffer-create "*EXWM Workspaces*")))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'exwm-workspace-overview-mode)
+        (exwm-workspace-overview-mode))
+      (setq exwm-workspace--overview-noted nil)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (exwm-workspace--overview-text
+                 (exwm-workspace--overview-sections)))
+        (goto-char (point-min))))
+    (let ((shown (get-buffer-window buf t)))
+      (pop-to-buffer buf)
+      (unless shown
+        (run-hook-with-args 'exwm-workspace-overview-hook t)))))
+
+(defun exwm-workspace-overview ()
+  "Show each monitor's workspaces, or close that overview.
+With `exwm-workspace-strip' nil, one heading lists the global
+workspaces.  RET or mouse-1 switches and closes the overview.
+`exwm-workspace-overview-hook' runs with t when it opens and nil
+when it closes."
+  (interactive)
+  (if (and (derived-mode-p 'exwm-workspace-overview-mode)
+           (eq (current-buffer) (get-buffer "*EXWM Workspaces*")))
+      (exwm-workspace-overview-quit)
+    (exwm-workspace--overview-show)))
+
+(defun exwm-workspace-overview-quit ()
+  "Close the workspace overview."
+  (interactive)
+  (let ((buf (if (derived-mode-p 'exwm-workspace-overview-mode)
+                 (current-buffer)
+               (get-buffer "*EXWM Workspaces*"))))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (exwm-workspace--overview-note-close))
+      (quit-windows-on buf)
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(defun exwm-workspace-overview-switch (&optional event)
+  "Switch to the workspace at point and close the overview.
+EVENT is the mouse event that selected the line."
+  (interactive (list last-nonmenu-event))
+  (when (mouse-event-p event)
+    (mouse-set-point event))
+  (let ((index (get-text-property (point) 'exwm-workspace-index)))
+    (unless (numberp index)
+      (user-error "[EXWM] No workspace here"))
+    (exwm-workspace-overview-quit)
+    (exwm-workspace-switch index)))
+
+(defun exwm-workspace--showing-desktop-next (current requested)
+  "Return (ACTION . WANT) for a show-desktop request.
+CURRENT is nil or non-nil.  REQUESTED nil toggles, 0 hides, and
+any other value shows.  ACTION is `show', `hide', or nil when
+WANT is already in effect."
+  (let ((want (cond
+               ((null requested) (not current))
+               ((eql requested 0) nil)
+               (t t))))
+    (cons (if (eq (not (null current)) want)
+              nil
+            (if want 'show 'hide))
+          want)))
+
+(defun exwm-workspace--publish-showing-desktop ()
+  "Publish `_NET_SHOWING_DESKTOP' as 0 or 1."
+  (when (and exwm--connection exwm--root)
+    (xcb:+request exwm--connection
+        (make-instance 'xcb:ewmh:set-_NET_SHOWING_DESKTOP
+                       :window exwm--root
+                       :data (if exwm-workspace--showing-desktop 1 0)))
+    (xcb:flush exwm--connection)))
+
+(defun exwm-workspace--showing-desktop-park (window)
+  "Remember WINDOW's geometry and move it off screen."
+  (when (and window exwm--connection)
+    (let ((geometry (xcb:+request-unchecked+reply exwm--connection
+                        (make-instance 'xcb:GetGeometry
+                                       :drawable window))))
+      (when (and geometry
+                 (> (slot-value geometry 'width) 1)
+                 (> (slot-value geometry 'height) 1))
+        (with-slots (x y width height) geometry
+          (push (list window x y width height)
+                exwm-workspace--showing-desktop-geometry))))
+    (exwm--set-geometry window
+                        exwm-layout--floating-hidden-position
+                        exwm-layout--floating-hidden-position
+                        1 1)))
+
+(cl-defun exwm-workspace--show-desktop ()
+  "Unmap managed clients and park workspace containers.
+A second call does nothing, so the saved geometry is kept."
+  (when exwm-workspace--showing-desktop
+    (cl-return-from exwm-workspace--show-desktop))
+  (setq exwm-workspace--showing-desktop t
+        exwm-workspace--showing-desktop-clients nil
+        exwm-workspace--showing-desktop-geometry nil)
+  (dolist (pair exwm--id-buffer-alist)
+    (let ((id (car pair)))
+      (when (buffer-live-p (cdr pair))
+        (with-current-buffer (cdr pair)
+          (unless (exwm-layout--iconic-state-p)
+            (push id exwm-workspace--showing-desktop-clients))))))
+  (dolist (id exwm-workspace--showing-desktop-clients)
+    (when (exwm--id->buffer id)
+      (exwm-layout--hide id)))
+  (dolist (frame exwm-workspace--list)
+    (when (frame-live-p frame)
+      (exwm-workspace--showing-desktop-park
+       (frame-parameter frame 'exwm-container))))
+  (when (and (exwm-workspace--minibuffer-own-frame-p)
+             (frame-live-p exwm-workspace--minibuffer))
+    (exwm-workspace--showing-desktop-park
+     (frame-parameter exwm-workspace--minibuffer 'exwm-container)))
+  (dolist (frame exwm-workspace--list)
+    (exwm-floating--sync-workspace frame nil))
+  (exwm-workspace--raise-child-frames)
+  (exwm-workspace--publish-showing-desktop))
+
+(cl-defun exwm-workspace--restore-desktop ()
+  "Restore windows hidden by `exwm-workspace--show-desktop'.
+A second call does nothing."
+  (unless exwm-workspace--showing-desktop
+    (cl-return-from exwm-workspace--restore-desktop))
+  (setq exwm-workspace--showing-desktop nil)
+  (dolist (spec (nreverse exwm-workspace--showing-desktop-geometry))
+    (exwm--set-geometry (nth 0 spec) (nth 1 spec) (nth 2 spec)
+                        (nth 3 spec) (nth 4 spec)))
+  (setq exwm-workspace--showing-desktop-geometry nil)
+  (dolist (frame exwm-workspace--list)
+    (when (frame-live-p frame)
+      (exwm-workspace--set-fullscreen frame)
+      (exwm-floating--sync-workspace
+       frame (exwm-workspace--active-p frame))))
+  (dolist (id exwm-workspace--showing-desktop-clients)
+    (let ((buffer (exwm--id->buffer id)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (let ((window (get-buffer-window nil t)))
+            (when window
+              (exwm-layout--show id window)))))))
+  (setq exwm-workspace--showing-desktop-clients nil)
+  (exwm-workspace--raise-child-frames)
+  (exwm-workspace--publish-showing-desktop)
+  (when exwm--connection
+    (xcb:flush exwm--connection)))
+
+(defun exwm-workspace-toggle-showing-desktop (&optional requested)
+  "Toggle showing the desktop.
+With no argument, toggle.  REQUESTED 0 restores the windows.
+Any other non-nil REQUESTED shows the desktop.  Asking for the
+state that is already in effect does nothing.
+
+Showing the desktop unmaps managed clients that are not already
+minimized and moves each workspace container to
+`exwm-layout--floating-hidden-position', remembering geometry.
+The same command, or a `_NET_SHOWING_DESKTOP' client message,
+restores both."
+  (interactive)
+  (unless exwm--connection
+    (user-error "[EXWM] Not connected"))
+  (let ((action (car (exwm-workspace--showing-desktop-next
+                      exwm-workspace--showing-desktop requested))))
+    (cond
+     ((eq action 'show) (exwm-workspace--show-desktop))
+     ((eq action 'hide) (exwm-workspace--restore-desktop)))))
+
 (defvar exwm-workspace-mode-line-map
   (let ((map (make-sparse-keymap)))
     (define-key map [mode-line mouse-1] #'exwm-workspace-mode-line-menu)
@@ -1034,10 +1709,16 @@ urgency sets the same frame parameter."
     (let* ((index (or exwm-workspace-current-index 0))
            (frame (nth index exwm-workspace--list))
            (urgent (and frame (frame-parameter frame 'exwm-urgency)))
-           (text (exwm-workspace--format-label
-                  index
-                  (and frame (frame-parameter frame 'exwm-workspace-name))
-                  urgent)))
+           (name (and frame (frame-parameter frame 'exwm-workspace-name)))
+           (text (if (and exwm-workspace-strip frame)
+                     (exwm-workspace--format-strip-label
+                      (frame-parameter frame 'exwm-randr-monitor)
+                      (or (exwm-workspace--strip-slot
+                           (exwm-workspace--strip-entries)
+                           frame t)
+                          (1+ index))
+                      name urgent)
+                   (exwm-workspace--format-label index name urgent))))
       (propertize (concat " [" text "] ")
                   'face (and urgent 'warning)
                   'mouse-face 'mode-line-highlight
@@ -1067,6 +1748,8 @@ urgency sets the same frame parameter."
     (define-key menu [swap] '(menu-item "Swap" exwm-workspace-swap))
     (define-key menu [rename] '(menu-item "Rename" exwm-workspace-rename))
     (define-key menu [urgent] '(menu-item "Mark urgent" exwm-workspace-mark-urgent))
+    (define-key menu [overview] '(menu-item "Overview" exwm-workspace-overview))
+    (define-key menu [desktop] '(menu-item "Show desktop" exwm-workspace-toggle-showing-desktop))
     menu))
 
 (defun exwm-workspace--menu-command (binding)
@@ -1509,9 +2192,11 @@ yields 0."
               (buffer-local-value 'exwm--frame buffer))))))))
 
 (defun exwm-workspace--child-frame-hidden-p (frame)
-  "Non-nil when FRAME's workspace is not active."
-  (let ((workspace (exwm-workspace--child-frame-workspace frame)))
-    (and workspace (not (exwm-workspace--active-p workspace)))))
+  "Non-nil when FRAME's workspace is not active.
+Also non-nil while the desktop is showing."
+  (or exwm-workspace--showing-desktop
+      (let ((workspace (exwm-workspace--child-frame-workspace frame)))
+        (and workspace (not (exwm-workspace--active-p workspace))))))
 
 (defun exwm-workspace--child-frame-note (outer-id abs-x abs-y rel-x rel-y)
   "Record OUTER-ID at root position ABS-X ABS-Y and parent-relative REL-X REL-Y.
@@ -1952,10 +2637,20 @@ ALIST is an action alist, as accepted by function `display-buffer'."
     ;; Copy RandR frame parameters from the first workspace to
     ;; prevent potential problems.  The values do not matter here as
     ;; they'll be updated by the RandR module later.
-    (let ((w (car exwm-workspace--list)))
+    (let ((w (or (and exwm-workspace-strip
+                      (frame-live-p exwm-workspace--current)
+                      (not (eq exwm-workspace--current frame))
+                      exwm-workspace--current)
+                 (car exwm-workspace--list))))
       (dolist (param '(exwm-randr-monitor
                        exwm-geometry))
         (set-frame-parameter frame param (frame-parameter w param))))
+    (when (stringp exwm-workspace--strip-target-monitor)
+      (set-frame-parameter frame 'exwm-randr-monitor
+                           exwm-workspace--strip-target-monitor))
+    (when (numberp exwm-workspace--strip-target-order)
+      (set-frame-parameter frame 'exwm-workspace-strip-order
+                           exwm-workspace--strip-target-order))
     ;; Support transparency on the container X window when the Emacs frame
     ;; does.  Note that in addition to setting the visual, colormap and depth
     ;; we must also reset the `:border-pixmap', as its default value is
@@ -2018,12 +2713,19 @@ ALIST is an action alist, as accepted by function `display-buffer'."
                exwm-workspace-current-index original-index))
     (run-hooks 'exwm-workspace-list-change-hook)))
 
-(defun exwm-workspace--get-next-workspace (frame &optional allow-active)
+(cl-defun exwm-workspace--get-next-workspace (frame &optional allow-active)
   "Return the workspace that replaces FRAME.
 Search later workspaces first, then earlier ones.  Skip FRAME.
 When ALLOW-ACTIVE is nil, return only a workspace that is not active.
 When ALLOW-ACTIVE is non-nil, an active workspace is acceptable.
-Return nil when no such workspace exists."
+Return nil when no such workspace exists.
+`exwm-workspace--next-workspace', when it is a live other workspace,
+is returned instead."
+  (let ((chosen exwm-workspace--next-workspace))
+    (when (and (frame-live-p chosen)
+               (not (eq chosen frame))
+               (exwm-workspace--workspace-p chosen))
+      (cl-return-from exwm-workspace--get-next-workspace chosen)))
   (let* ((index (exwm-workspace--position frame))
          (count (exwm-workspace--count)))
     (or
@@ -2364,6 +3066,7 @@ applied to all subsequently created X frames."
   (exwm-workspace-switch 0 t)
   (when exwm-workspace-show-mode-line
     (exwm-workspace--set-mode-line 'exwm-workspace-show-mode-line t))
+  (exwm-workspace--publish-showing-desktop)
   ;; Prevent frame parameters introduced by this module from being
   ;; saved/restored.
   (dolist (i '(exwm-active exwm-outer-id exwm-id exwm-container exwm-geometry
@@ -2406,7 +3109,10 @@ applied to all subsequently created X frames."
   ;; Don't let dead frames linger.
   (setq exwm-workspace--current nil)
   (setq exwm-workspace-current-index 0)
-  (setq exwm-workspace--list nil))
+  (setq exwm-workspace--list nil)
+  (setq exwm-workspace--showing-desktop nil
+        exwm-workspace--showing-desktop-geometry nil
+        exwm-workspace--showing-desktop-clients nil))
 
 (defun exwm-workspace--post-init ()
   "The second stage in the initialization of the workspace module."

@@ -421,6 +421,16 @@ One of `line-mode' or `char-mode'.")
      ["Toggle minibuffer" exwm-workspace-toggle-minibuffer]
      ["Switch workspace" exwm-workspace-switch]
      ["Switch to previous workspace" exwm-workspace-switch-previous]
+     ["Workspace overview" exwm-workspace-overview]
+     ["Show desktop" exwm-workspace-toggle-showing-desktop]
+     ("Strip"
+      ["Left" exwm-workspace-strip-left]
+      ["Right" exwm-workspace-strip-right]
+      ["Add on this monitor" exwm-workspace-strip-add]
+      ["Close" exwm-workspace-strip-close]
+      ["Move left" exwm-workspace-strip-move-left]
+      ["Move right" exwm-workspace-strip-move-right]
+      ["Select slot" exwm-workspace-strip-select])
      ;; Place this entry at bottom to avoid selecting others by accident.
      ("Switch to" :active (cdr exwm-workspace--list) :filter
       ,(lambda (&rest _args)
