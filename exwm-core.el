@@ -369,6 +369,7 @@ One of `line-mode' or `char-mode'.")
   `("EXWM"
     ("General"
      ["Run or raise" exwm-run-or-raise]
+     ["Launch application" exwm-launch-app]
      ["Toggle floating" exwm-floating-toggle-floating]
      ["Float window" exwm-floating-set-floating]
      ["Tile window" exwm-floating-unset-floating]

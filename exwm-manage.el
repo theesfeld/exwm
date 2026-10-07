@@ -299,13 +299,104 @@ Override current hinds if FORCE is non-nil."
 Sets the `default-directory' of the EXWM buffer associated with X window to
 match its current working directory.
 
-This only works when procfs is mounted, which may not be the case on some BSDs."
+This only works when procfs is mounted, which may not be the case on some BSDs.
+A later shell prompt can update the same buffer with `exwm-report-cwd'."
   (with-current-buffer (exwm--id->buffer id)
     (if-let* ((pid (exwm-manage-get-pid))
               (cwd (file-symlink-p (format "/proc/%d/cwd" pid)))
               ((file-accessible-directory-p cwd)))
         (setq default-directory (file-name-as-directory cwd))
       (setq default-directory (expand-file-name "~/")))))
+
+(defun exwm-report-cwd--ppid-from-status (text)
+  "Return the parent pid recorded in a /proc status TEXT.
+Nil when the PPid line is absent."
+  (when (and (stringp text)
+             (string-match "\\(?:\\`\\|\n\\)PPid:[ \t]+\\([0-9]+\\)" text))
+    (string-to-number (match-string 1 text))))
+
+(defun exwm-report-cwd--parent (pid)
+  "Return the parent pid of PID, or nil when /proc has none."
+  (let ((file (and (integerp pid) (format "/proc/%d/status" pid))))
+    (when (and file (file-readable-p file))
+      (exwm-report-cwd--ppid-from-status
+       (with-temp-buffer
+         (insert-file-contents file)
+         (buffer-string))))))
+
+(defun exwm-report-cwd--ancestors (pid parent-fn)
+  "Return PID and its parents, nearest first.
+PARENT-FN takes a pid and returns the parent, or nil.  The walk
+stops at pid 1, at a cycle, or after 64 steps."
+  (let ((seen nil)
+        (chain nil)
+        (current pid))
+    (while (and (integerp current)
+                (> current 1)
+                (not (memq current seen))
+                (< (length seen) 64))
+      (setq seen (cons current seen)
+            chain (cons current chain)
+            current (funcall parent-fn current)))
+    (nreverse chain)))
+
+(defun exwm-report-cwd--match (chain rows)
+  "Return the buffer in ROWS whose pid is earliest in CHAIN.
+ROWS is a list of (BUFFER PID)."
+  (let ((best nil)
+        (index nil))
+    (dolist (row rows)
+      (let ((at (cl-position (cadr row) chain)))
+        (when (and at (or (null index) (< at index)))
+          (setq best (car row)
+                index at))))
+    best))
+
+(defun exwm-report-cwd--local-directory (directory)
+  "Return DIRECTORY as a local directory, or nil.
+A remote path or a path that cannot be used as `default-directory'
+is nil."
+  (when (stringp directory)
+    (let ((directory (expand-file-name directory)))
+      (when (and (not (file-remote-p directory))
+                 (file-accessible-directory-p directory))
+        (file-name-as-directory directory)))))
+
+(defun exwm-report-cwd--client-rows ()
+  "Return (BUFFER PID) for each managed client with a pid."
+  (let (rows)
+    (dolist (pair exwm--id-buffer-alist)
+      (let ((buffer (cdr pair)))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (when (derived-mode-p 'exwm-mode)
+              (let ((pid (exwm-manage-get-pid (car pair))))
+                (when (integerp pid)
+                  (setq rows (cons (list buffer pid) rows)))))))))
+    (nreverse rows)))
+
+(defun exwm-report-cwd (pid directory)
+  "Set `default-directory' of the client that owns PID.
+DIRECTORY is the shell's current directory.  Parent pids are
+walked until an `exwm-mode' buffer has that `_NET_WM_PID'.
+An inaccessible directory is ignored.  The shell files in
+`etc/exwm.bash', `etc/exwm.zsh', and `etc/exwm.fish' call this
+from the prompt when `INSIDE_EXWM' is set."
+  (interactive "nPid: \nDDirectory: ")
+  (let ((pid (cond ((integerp pid) pid)
+                   ((and (stringp pid)
+                         (string-match-p "\\`[0-9]+\\'" pid))
+                    (string-to-number pid))))
+        (directory (exwm-report-cwd--local-directory directory)))
+    (when (and (integerp pid) (> pid 1) directory)
+      (let ((buffer (exwm-report-cwd--match
+                     (exwm-report-cwd--ancestors
+                      pid #'exwm-report-cwd--parent)
+                     (exwm-report-cwd--client-rows))))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (setq default-directory directory))
+          directory)))))
 
 (defun exwm-manage--set-client-list ()
   "Set _NET_CLIENT_LIST."
