@@ -411,6 +411,16 @@ One of `line-mode' or `char-mode'.")
 
      ["Define global binding" exwm-input-set-key])
 
+    ("Focus"
+     ["Left" exwm-focus-left]
+     ["Right" exwm-focus-right]
+     ["Up" exwm-focus-up]
+     ["Down" exwm-focus-down]
+     ["Monitor left" exwm-output-focus-left]
+     ["Monitor right" exwm-output-focus-right]
+     ["Monitor up" exwm-output-focus-up]
+     ["Monitor down" exwm-output-focus-down])
+
     ("Workspace"
      ["Add workspace" exwm-workspace-add]
      ["Delete current workspace" exwm-workspace-delete]
