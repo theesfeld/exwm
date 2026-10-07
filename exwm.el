@@ -886,7 +886,7 @@ session."
                             xcb:Atom:_NET_DESKTOP_GEOMETRY
                             xcb:Atom:_NET_DESKTOP_VIEWPORT
                             xcb:Atom:_NET_CURRENT_DESKTOP
-                            ;; xcb:Atom:_NET_DESKTOP_NAMES
+                            xcb:Atom:_NET_DESKTOP_NAMES
                             xcb:Atom:_NET_ACTIVE_WINDOW
                             ;; xcb:Atom:_NET_WORKAREA
                             xcb:Atom:_NET_SUPPORTING_WM_CHECK
