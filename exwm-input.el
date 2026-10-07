@@ -88,6 +88,133 @@ defined in `exwm-mode-map' here."
   "Non-nil makes `line-mode' forward all events to Emacs."
   :type 'boolean)
 
+;; Declared here so the setter below can be defined before the option.
+(defvar exwm-input-modifiers)
+(defvar exwm-input--installed-modifier-masks nil
+  "Modifier masks currently grabbed for `exwm-input-modifiers'.")
+
+(defun exwm-input--set-modifiers (symbol value)
+  "Setter for `exwm-input-modifiers'."
+  (let (clean)
+    (dolist (mod value)
+      (if (memq mod '(super hyper meta control alt))
+          (cl-pushnew mod clean)
+        (warn "EXWM: %S is not a valid `exwm-input-modifiers' entry and was ignored"
+              mod)))
+    (set-default symbol (nreverse clean)))
+  (when exwm--connection
+    (exwm-input--grab-modifiers-on-all-windows)))
+
+(defun exwm-input--lock-masks ()
+  "Lock masks combined with a reserved modifier.
+Caps Lock and Num Lock must not defeat the grab."
+  (let ((masks (list 0)))
+    (when (/= 0 xcb:keysyms:num-lock-mask)
+      (push xcb:keysyms:num-lock-mask masks))
+    (when (/= 0 xcb:keysyms:lock-mask)
+      (push xcb:keysyms:lock-mask masks)
+      (when (/= 0 xcb:keysyms:num-lock-mask)
+        (push (logior xcb:keysyms:lock-mask xcb:keysyms:num-lock-mask)
+              masks)))
+    masks))
+
+(defun exwm-input--modifier-masks ()
+  "X masks for `exwm-input-modifiers', including lock combinations."
+  (let* ((named `((super . ,xcb:keysyms:super-mask)
+                  (hyper . ,xcb:keysyms:hyper-mask)
+                  (meta . ,xcb:keysyms:meta-mask)
+                  (control . ,xcb:keysyms:control-mask)
+                  (alt . ,xcb:keysyms:alt-mask)))
+         (masks nil))
+    (dolist (mod exwm-input-modifiers)
+      (let ((base (cdr (assq mod named))))
+        (when (and base (/= 0 base))
+          (dolist (lock (exwm-input--lock-masks))
+            (cl-pushnew (logior base lock) masks)))))
+    masks))
+
+(defun exwm-input--modifier-event-p (event)
+  "Return non-nil if EVENT uses a modifier in `exwm-input-modifiers'."
+  (and exwm-input-modifiers
+       (let ((mods (event-modifiers event)))
+         (cl-some (lambda (mod) (memq mod mods)) exwm-input-modifiers))))
+
+(defun exwm-input--ungrab-modifiers (&rest xwins)
+  "Release reserved-modifier grabs on XWINS.
+Leave `exwm-input--installed-modifier-masks' unchanged so the grabs
+can be restored.  Line-mode grabs every key with AnyModifier, and
+that request fails while a narrower modifier grab is installed."
+  (when (and exwm--connection exwm-input--installed-modifier-masks)
+    (let ((ungrab (make-instance 'xcb:UngrabKey
+                                 :key xcb:Grab:Any
+                                 :grab-window nil
+                                 :modifiers nil)))
+      (dolist (xwin xwins)
+        (dolist (mask exwm-input--installed-modifier-masks)
+          (setf (slot-value ungrab 'grab-window) xwin
+                (slot-value ungrab 'modifiers) mask)
+          (xcb:+request exwm--connection ungrab)))
+      (xcb:flush exwm--connection))))
+
+(defun exwm-input--grab-modifiers (&rest xwins)
+  "Grab or release `exwm-input-modifiers' on XWINS."
+  (when exwm--connection
+    (let ((masks (exwm-input--modifier-masks))
+          (grab (make-instance 'xcb:GrabKey
+                               :owner-events 0
+                               :grab-window nil
+                               :modifiers nil
+                               :key xcb:Grab:Any
+                               :pointer-mode xcb:GrabMode:Async
+                               :keyboard-mode xcb:GrabMode:Async))
+          (ungrab (make-instance 'xcb:UngrabKey
+                                 :key xcb:Grab:Any
+                                 :grab-window nil
+                                 :modifiers nil)))
+      (dolist (xwin xwins)
+        (dolist (mask exwm-input--installed-modifier-masks)
+          (setf (slot-value ungrab 'grab-window) xwin
+                (slot-value ungrab 'modifiers) mask)
+          (xcb:+request exwm--connection ungrab))
+        (dolist (mask masks)
+          (setf (slot-value grab 'grab-window) xwin
+                (slot-value grab 'modifiers) mask)
+          (xcb:+request exwm--connection grab)))
+      (setq exwm-input--installed-modifier-masks masks)
+      (xcb:flush exwm--connection))))
+
+(defun exwm-input--grab-modifiers-on-all-windows ()
+  "Apply `exwm-input-modifiers' to every existing X window."
+  (when-let* ((tree (xcb:+request-unchecked+reply exwm--connection
+                        (make-instance 'xcb:QueryTree
+                                       :window exwm--root))))
+    (apply #'exwm-input--grab-modifiers
+           (slot-value tree 'children))))
+
+(defcustom exwm-input-modifiers nil
+  "Modifiers whose chords always go to Emacs.
+
+Each entry is one of `super', `hyper', `meta', `control', or `alt'.
+A chord that uses one of these modifiers is handled by Emacs in both
+`line-mode' and `char-mode'.  The application does not see it.  This
+reserves a modifier for window management without listing every binding
+in `exwm-input-global-keys'.
+
+Super is the usual choice:
+
+  (setopt exwm-input-modifiers \\='(super))
+
+`shift' is not accepted.  Grabbing it would swallow ordinary capital
+letters.  `control' and `meta' work, and they also stop applications
+from seeing those chords while a window is in `char-mode'.
+
+A modifier that is not present on the keyboard is skipped.  Set this
+before EXWM starts.  `setopt' and Customize apply a new value
+immediately, including after EXWM has started."
+  :type '(set (const super) (const hyper) (const meta)
+              (const control) (const alt))
+  :set #'exwm-input--set-modifiers)
+
 ;; Input focus update requests should be accumulated for a short time
 ;; interval so that only the last one need to be processed.  This not
 ;; improves the overall performance, but avoids the problem of input
@@ -529,6 +656,7 @@ attempt later."
               (when alt-modifier
                 (setf (slot-value req 'modifiers) alt-modifier)
                 (xcb:+request exwm--connection req)))))))
+    (apply #'exwm-input--grab-modifiers xwins)
     (xcb:flush exwm--connection)))
 
 (defun exwm-input--set-key (key command)
@@ -642,6 +770,7 @@ Current buffer must be an `exwm-mode' buffer."
       ;;
       (memq event exwm-input--global-prefix-keys)
       (memq event exwm-input-prefix-keys)
+      (exwm-input--modifier-event-p event)
       (when overriding-terminal-local-map
         (lookup-key overriding-terminal-local-map
                     (vector event)))
@@ -801,6 +930,9 @@ button event."
   (unless id (setq id (exwm--buffer->id (window-buffer))))
   (when id
     (exwm--log "id=#x%x" id)
+    ;; AnyModifier cannot be grabbed while a reserved-modifier grab
+    ;; is still installed on this window.
+    (exwm-input--ungrab-modifiers id)
     (when (xcb:+request-checked+request-check exwm--connection
               (make-instance 'xcb:GrabKey
                              :owner-events 0
