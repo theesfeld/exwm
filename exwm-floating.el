@@ -29,6 +29,8 @@
 (require 'xcb-cursor)
 (require 'exwm-core)
 
+(defvar exwm-manage--display-window)
+
 (defgroup exwm-floating nil
   "Floating."
   :group 'exwm)
@@ -385,8 +387,10 @@ A buffer with `exwm--stay-tiled' set stays tiled unless
                          :window outer-id :parent frame-container :x 0 :y 0))
       ;; Switch from tiling to floating actions.
       (exwm-floating--set-allowed-actions id nil)
-      ;; Finally, focus the frame.
-      (select-frame-set-input-focus frame)
+      ;; Finally, focus the frame.  A startup notification for a
+      ;; workspace the user has left must not pull focus back.
+      (unless exwm-manage--display-window
+        (select-frame-set-input-focus frame))
       ;; Flush everything.
       (xcb:flush exwm--connection)
       ;; Update the layout.
@@ -443,7 +447,8 @@ A buffer with `exwm--stay-tiled' set stays tiled unless
       (when exwm--floating-frame        ;from floating to non-floating
         (set-window-dedicated-p (frame-first-window exwm--floating-frame) nil)
         ;; Select a tiling window and delete the old frame.
-        (select-window (frame-selected-window exwm-workspace--current))
+        (unless exwm-manage--display-window
+          (select-window (frame-selected-window exwm-workspace--current)))
         (with-current-buffer buffer
           (delete-frame exwm--floating-frame))))
     (with-current-buffer buffer
@@ -451,7 +456,10 @@ A buffer with `exwm--stay-tiled' set stays tiled unless
             exwm--floating-frame nil))
     ;; Only show X windows in normal state.
     (unless (exwm-layout--iconic-state-p)
-      (pop-to-buffer-same-window buffer)))
+      (if (and exwm-manage--display-window
+               (window-live-p exwm-manage--display-window))
+          (set-window-buffer exwm-manage--display-window buffer)
+        (pop-to-buffer-same-window buffer))))
   (with-current-buffer (exwm--id->buffer id)
     (run-hooks 'exwm-floating-exit-hook)))
 
