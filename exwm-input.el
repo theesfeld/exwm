@@ -36,6 +36,7 @@
 ;;; Code:
 
 (require 'xcb-keysyms)
+(require 'xcb-xtest)
 (require 'exwm-core)
 
 (defgroup exwm-input nil
@@ -435,7 +436,8 @@ ARGS are additional arguments to CALLBACK."
   "Update global prefix keys."
   (exwm--log)
   (let ((exwm-input--global-prefix-keys nil))
-    (exwm-input--update-global-prefix-keys)))
+    (exwm-input--update-global-prefix-keys))
+  (exwm-input--xtest-refresh-modifiers))
 
 (defun exwm-input--on-buffer-list-update ()
   "Run in `buffer-list-update-hook' to track input focus."
@@ -1048,8 +1050,159 @@ When ID is non-nil, toggle in its correpsonding window."
         (char-mode
          (exwm-reset))))))
 
+(defvar exwm-input--xtest nil
+  "Non-nil when the server's XTEST extension can inject key events.")
+
+(defvar exwm-input--xtest-modifiers nil
+  "Modifiers XTEST may press and release while injecting a key.
+Each element is (MASK KEYCODE...).  Locking modifiers such as
+Caps Lock and Num Lock are omitted: a press toggles them instead
+of holding them.")
+
+(defconst exwm-input--xtest-lock-keysyms
+  '(#xffe5 #xffe6 #xff7f #xff14 #xfe01)
+  "Keysyms that lock rather than hold: Caps, Shift Lock, Num, Scroll, ISO Lock.")
+
+(defun exwm-input--xtest-sync ()
+  "Wait until the X server has processed requests already sent."
+  (xcb:+request-unchecked+reply exwm--connection
+      (make-instance 'xcb:GetInputFocus)))
+
+(defun exwm-input--xtest-refresh-modifiers ()
+  "Cache keycodes of modifiers that XTEST can hold temporarily."
+  (setq exwm-input--xtest-modifiers nil)
+  (when exwm-input--xtest
+    (let ((reply (xcb:+request-unchecked+reply exwm--connection
+                     (make-instance 'xcb:GetModifierMapping))))
+      (when reply
+        (with-slots (keycodes-per-modifier keycodes) reply
+          (when (> keycodes-per-modifier 0)
+            (let ((masks (list xcb:ModMask:Shift
+                               xcb:ModMask:Lock
+                               xcb:ModMask:Control
+                               xcb:ModMask:1
+                               xcb:ModMask:2
+                               xcb:ModMask:3
+                               xcb:ModMask:4
+                               xcb:ModMask:5))
+                  entries)
+              (dotimes (i 8)
+                (let (codes lock)
+                  (dotimes (j keycodes-per-modifier)
+                    (let ((code (elt keycodes
+                                     (+ (* i keycodes-per-modifier) j))))
+                      (when (and code (> code 0))
+                        (push code codes)
+                        (when (memq (car (xcb:keysyms:keycode->keysym
+                                          exwm--connection code 0))
+                                    exwm-input--xtest-lock-keysyms)
+                          (setq lock t)))))
+                  (when (and codes (not lock))
+                    (push (cons (nth i masks) (nreverse codes)) entries))))
+              (setq exwm-input--xtest-modifiers (nreverse entries)))))))))
+
+(defun exwm-input--xtest-key-down-p (keymap keycode)
+  "Whether KEYMAP, a 32-byte `QueryKeymap' result, shows KEYCODE held."
+  (and keymap
+       (<= 0 keycode 255)
+       (/= 0 (logand (elt keymap (/ keycode 8))
+                     (ash 1 (% keycode 8))))))
+
+(defun exwm-input--xtest-event (keycode press)
+  "Send one XTEST key press or release of KEYCODE.
+PRESS non-nil sends KeyPress.  The event is not marked SendEvent."
+  (xcb:+request exwm--connection
+      (make-instance 'xcb:xtest:FakeInput
+                     ;; 2 is KeyPress and 3 is KeyRelease.
+                     :type (if press 2 3)
+                     :detail keycode
+                     :time xcb:Time:CurrentTime
+                     :root xcb:Window:None
+                     :rootX 0
+                     :rootY 0
+                     :deviceid 0)))
+
+(defun exwm-input--xtest-restore-grabs (id)
+  "Put back the key grabs on window ID after an XTEST injection."
+  (let* ((buffer (exwm--id->buffer id))
+         (line (and buffer
+                    (eq (buffer-local-value 'exwm--input-mode buffer)
+                        'line-mode))))
+    (if line
+        (progn
+          ;; AnyModifier cannot be grabbed while a reserved-modifier
+          ;; grab is still installed.
+          (exwm-input--ungrab-modifiers id)
+          (when (xcb:+request-checked+request-check exwm--connection
+                    (make-instance 'xcb:GrabKey
+                                   :owner-events 0
+                                   :grab-window id
+                                   :modifiers xcb:ModMask:Any
+                                   :key xcb:Grab:Any
+                                   :pointer-mode xcb:GrabMode:Async
+                                   :keyboard-mode xcb:GrabMode:Sync))
+            (exwm--log "Failed to restore keyboard grab for #x%x" id)))
+      (exwm-input--grab-global-prefix-keys id))
+    (xcb:flush exwm--connection)))
+
+(defun exwm-input--xtest-key (id keycode state)
+  "Inject KEYCODE with modifier STATE into the client that has ID.
+XTEST events are ordinary key events, so clients that ignore
+SendEvent still receive them.  Modifiers in STATE that are not held
+are pressed for the duration of the key, and held modifiers that are
+not in STATE are released, then both are restored.  The grab is
+lifted first: line-mode's grab would otherwise consume the keys."
+  (let* ((reply (xcb:+request-unchecked+reply exwm--connection
+                    (make-instance 'xcb:QueryKeymap)))
+         (keymap (and reply (slot-value reply 'keys)))
+         release press)
+    (dolist (entry exwm-input--xtest-modifiers)
+      (let* ((mask (car entry))
+             (codes (cdr entry))
+             (want (/= 0 (logand (or state 0) mask)))
+             held)
+        (dolist (code codes)
+          (when (exwm-input--xtest-key-down-p keymap code)
+            (setq held t)))
+        (cond ((and held (not want))
+               (dolist (code codes)
+                 (when (exwm-input--xtest-key-down-p keymap code)
+                   (push code release))))
+              ((and want (not held))
+               (push (car codes) press)))))
+    (setq release (nreverse release)
+          press (nreverse press))
+    (unwind-protect
+        (progn
+          ;; The key that invoked simulation may still own an active grab.
+          ;; UngrabKey does not release that; UngrabKeyboard does.
+          (xcb:+request-checked+request-check exwm--connection
+              (make-instance 'xcb:UngrabKeyboard
+                             :time xcb:Time:CurrentTime))
+          (xcb:+request exwm--connection
+              (make-instance 'xcb:UngrabKey
+                             :key xcb:Grab:Any
+                             :grab-window id
+                             :modifiers xcb:ModMask:Any))
+          (exwm-input--xtest-sync)
+          (dolist (code release)
+            (exwm-input--xtest-event code nil))
+          (dolist (code press)
+            (exwm-input--xtest-event code t))
+          (exwm-input--xtest-event keycode t)
+          (exwm-input--xtest-event keycode nil)
+          (dolist (code (reverse press))
+            (exwm-input--xtest-event code nil))
+          (dolist (code (reverse release))
+            (exwm-input--xtest-event code t))
+          (exwm-input--xtest-sync))
+      (exwm-input--xtest-restore-grabs id))))
+
 (defun exwm-input--fake-key (event)
-  "Fake a key event equivalent to Emacs event EVENT."
+  "Fake a key event equivalent to Emacs event EVENT.
+XTEST is used when the server supports it, because clients such as
+GTK 4 and Wine ignore events sent with SendEvent.  SendEvent remains
+the fallback."
   (let* ((keysyms (xcb:keysyms:event->keysyms exwm--connection event))
          keycode id)
     (when (= 0 (caar keysyms))
@@ -1058,23 +1211,26 @@ When ID is non-nil, toggle in its correpsonding window."
                                                (caar keysyms)))
     (when (/= 0 keycode)
       (setq id (exwm--buffer->id (window-buffer (selected-window))))
-      (exwm--log "id=#x%x event=%s keycode" id event keycode)
-      (dolist (class '(xcb:KeyPress xcb:KeyRelease))
-        (xcb:+request exwm--connection
-            (make-instance 'xcb:SendEvent
-                           :propagate 0 :destination id
-                           :event-mask xcb:EventMask:NoEvent
-                           :event (xcb:marshal
-                                   (make-instance class
-                                                  :detail keycode
-                                                  :time xcb:Time:CurrentTime
-                                                  :root exwm--root :event id
-                                                  :child 0
-                                                  :root-x 0 :root-y 0
-                                                  :event-x 0 :event-y 0
-                                                  :state (cdar keysyms)
-                                                  :same-screen 1)
-                                   exwm--connection)))))
+      (exwm--log "id=#x%x event=%s keycode=%s xtest=%s"
+                 id event keycode exwm-input--xtest)
+      (if (and exwm-input--xtest id)
+          (exwm-input--xtest-key id keycode (cdar keysyms))
+        (dolist (class '(xcb:KeyPress xcb:KeyRelease))
+          (xcb:+request exwm--connection
+              (make-instance 'xcb:SendEvent
+                             :propagate 0 :destination id
+                             :event-mask xcb:EventMask:NoEvent
+                             :event (xcb:marshal
+                                     (make-instance class
+                                                    :detail keycode
+                                                    :time xcb:Time:CurrentTime
+                                                    :root exwm--root :event id
+                                                    :child 0
+                                                    :root-x 0 :root-y 0
+                                                    :event-x 0 :event-y 0
+                                                    :state (cdar keysyms)
+                                                    :same-screen 1)
+                                     exwm--connection))))))
     (xcb:flush exwm--connection)))
 
 (cl-defun exwm-input-send-next-key (n &optional end-key)
@@ -1156,8 +1312,11 @@ Notes:
   finishes initialization has no effect.
 * Original-keys consist of multiple key events are only supported in Emacs
   26.2 and later.
-* A minority of applications do not accept simulated keys by default.  It's
-  required to customize them to accept events sent by SendEvent.
+* When the X server provides the XTEST extension, simulated keys are
+  injected with it so clients that ignore SendEvent still receive them.
+  The chord's modifiers are held only for that key, and EXWM lifts its
+  grab while the key is injected.  Otherwise EXWM uses SendEvent, and
+  those clients need their own setting to accept synthetic events.
 * The predefined examples in the Customize interface are not guaranteed to
   work for all applications.  This can be tweaked on a per application basis
   with `exwm-input-set-local-simulation-keys'."
@@ -1304,11 +1463,30 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
   (let ((exwm-input-line-mode-passthrough t))
     (apply function args)))
 
+(defun exwm-input--xtest-init ()
+  "Enable XTEST key injection when the server has the extension."
+  (setq exwm-input--xtest nil
+        exwm-input--xtest-modifiers nil)
+  (if (= 0 (slot-value (xcb:get-extension-data exwm--connection 'xcb:xtest)
+                       'present))
+      (exwm--log "XTEST is not available; simulation keys use SendEvent")
+    (let ((reply (xcb:+request-unchecked+reply exwm--connection
+                     (make-instance 'xcb:xtest:GetVersion
+                                    :major-version 2
+                                    :minor-version 2))))
+      (when reply
+        (with-slots (major-version minor-version) reply
+          (when (and major-version (>= major-version 2))
+            (setq exwm-input--xtest t)
+            (exwm--log "XTEST %s.%s" major-version minor-version)))))))
+
 (defun exwm-input--init ()
   "Initialize the keyboard module."
   (exwm--log)
-  ;; Refresh keyboard mapping
+  (exwm-input--xtest-init)
+  ;; Refresh keyboard mapping.  Modifier keycodes need this mapping.
   (xcb:keysyms:init exwm--connection #'exwm-input--on-keysyms-update)
+  (exwm-input--xtest-refresh-modifiers)
   ;; Create the X window and intern the atom used to fetch timestamp.
   (setq exwm-input--timestamp-window (xcb:generate-id exwm--connection))
   (xcb:+request exwm--connection
@@ -1372,6 +1550,8 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
 (defun exwm-input--exit ()
   "Exit the input module."
   (exwm--log)
+  (setq exwm-input--xtest nil
+        exwm-input--xtest-modifiers nil)
   (dolist (fun exwm-input--passthrough-functions)
     (advice-remove fun #'exwm-input--call-with-passthrough))
   (exwm-input--unset-simulation-keys)
