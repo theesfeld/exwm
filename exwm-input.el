@@ -507,6 +507,43 @@ way as `buffer-list-update-hook'."
   (setq exwm-input--update-focus-window (selected-window))
   (exwm-input--update-focus-defer))
 
+(defvar exwm-input--persp-after-load nil
+  "Non-nil once perspective packages are hooked for a later load.")
+
+(defun exwm-input--refresh-focus-after-persp (&rest _)
+  "Schedule input focus after a perspective switch.
+persp-mode and perspective.el restore a window configuration without
+going through `exwm-workspace-switch'.  The selected window is the
+one just restored."
+  (when exwm--connection
+    (exwm-input-refresh-focus)))
+
+(defun exwm-input--persp-setup ()
+  "Focus the restored window when a perspective package switches."
+  (when (boundp 'persp-activated-functions)
+    (add-hook 'persp-activated-functions
+              #'exwm-input--refresh-focus-after-persp))
+  (when (boundp 'persp-activated-hook)
+    (add-hook 'persp-activated-hook
+              #'exwm-input--refresh-focus-after-persp))
+  (unless exwm-input--persp-after-load
+    (setq exwm-input--persp-after-load t)
+    (with-eval-after-load 'persp-mode
+      (when exwm--connection
+        (add-hook 'persp-activated-functions
+                  #'exwm-input--refresh-focus-after-persp)))
+    (with-eval-after-load 'perspective
+      (when exwm--connection
+        (add-hook 'persp-activated-hook
+                  #'exwm-input--refresh-focus-after-persp)))))
+
+(defun exwm-input--persp-exit ()
+  "Remove the perspective focus hooks."
+  (remove-hook 'persp-activated-functions
+               #'exwm-input--refresh-focus-after-persp)
+  (remove-hook 'persp-activated-hook
+               #'exwm-input--refresh-focus-after-persp))
+
 (defun exwm-input--update-focus-commit ()
   "Attempt to update the window focus.
 If we're currently updating the window focus, re-schedule a focus update
@@ -1600,7 +1637,8 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
   (define-key global-map [remap scroll-other-window]
               #'exwm-input-scroll-other-window)
   (define-key global-map [remap scroll-other-window-down]
-              #'exwm-input-scroll-other-window-down))
+              #'exwm-input-scroll-other-window-down)
+  (exwm-input--persp-setup))
 
 (defun exwm-input--post-init ()
   "The second stage in the initialization of the input module."
@@ -1610,6 +1648,7 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
 (defun exwm-input--exit ()
   "Exit the input module."
   (exwm--log)
+  (exwm-input--persp-exit)
   (setq exwm-input--xtest nil
         exwm-input--xtest-modifiers nil)
   (dolist (fun exwm-input--passthrough-functions)
