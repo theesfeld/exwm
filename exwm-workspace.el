@@ -186,6 +186,7 @@ Stops a client that immediately reparents the frame back from looping.")
                   (buffer))
 (declare-function exwm-layout--refresh "exwm-layout.el")
 (declare-function exwm-layout--show "exwm-layout.el" (id &optional window))
+(declare-function exwm-layout--raise-fullscreen "exwm-layout.el" (frame))
 
 (defsubst exwm-workspace--position (frame)
   "Retrieve index of given FRAME in workspace list.
@@ -669,6 +670,11 @@ When FORCE is true, allow switching to current workspace."
                 (let ((window (get-buffer-window nil t)))
                   (when window
                     (exwm-layout--show exwm--id window))))))))
+      ;; A fullscreen client was mapped before its siblings.  Raise it
+      ;; after them, then raise child frames again so a popup stays
+      ;; above that client.
+      (exwm-layout--raise-fullscreen frame)
+      (exwm-workspace--raise-child-frames)
       (select-window window)
       (x-focus-frame (window-frame window)) ;The real input focus.
       (set-frame-parameter frame 'exwm-selected-window nil)
