@@ -54,6 +54,8 @@ and only take effect when they are present.  Note for certain options
 specifying nil is not exactly the same as leaving them out.  Currently
 possible choices:
 * floating: Force floating (non-nil) or tiling (nil) on startup.
+* stay-tiled: Keep the window tiled.  A client request to float is ignored.
+  `exwm-floating-set-floating' can still float it.
 * x/y/width/height: Override the initial geometry (floating X window only).
 * border-width: Override the border width (only visible when floating).
 * fullscreen: Force full screen (non-nil) on startup.
@@ -78,6 +80,7 @@ want to match against EXWM internal variables such as `exwm-title',
                 (plist :tag "Configurations"
                        :options
                        (((const :tag "Floating" floating) boolean)
+                        ((const :tag "Stay tiled" stay-tiled) boolean)
                         ((const :tag "X" x) number)
                         ((const :tag "Y" y) number)
                         ((const :tag "Width" width) number)
@@ -401,22 +404,21 @@ This only works when procfs is mounted, which may not be the case on some BSDs."
                            :button button :modifiers xcb:ModMask:Any)))
       (exwm-manage--set-client-list)
       (xcb:flush exwm--connection)
-      (if (plist-member exwm--configurations 'floating)
-          ;; User has specified whether it should be floating.
-          (if (plist-get exwm--configurations 'floating)
-              (exwm-floating--set-floating id)
-            (with-selected-window (frame-selected-window exwm--frame)
-              (exwm-floating--unset-floating id)))
-        ;; Try to determine if it should be floating.
-        (if (and (not exwm-manage-force-tiling)
-                 (or exwm-transient-for exwm--fixed-size
-                     (memq xcb:Atom:_NET_WM_WINDOW_TYPE_UTILITY
-                           exwm-window-type)
-                     (memq xcb:Atom:_NET_WM_WINDOW_TYPE_DIALOG
-                           exwm-window-type)))
-            (exwm-floating--set-floating id)
+      (setq exwm--stay-tiled
+            (and (plist-get exwm--configurations 'stay-tiled) t))
+      (if (or exwm--stay-tiled
+              (and (plist-member exwm--configurations 'floating)
+                   (not (plist-get exwm--configurations 'floating)))
+              (and (not (plist-member exwm--configurations 'floating))
+                   (or exwm-manage-force-tiling
+                       (not (or exwm-transient-for exwm--fixed-size
+                                (memq xcb:Atom:_NET_WM_WINDOW_TYPE_UTILITY
+                                      exwm-window-type)
+                                (memq xcb:Atom:_NET_WM_WINDOW_TYPE_DIALOG
+                                      exwm-window-type))))))
           (with-selected-window (frame-selected-window exwm--frame)
-            (exwm-floating--unset-floating id))))
+            (exwm-floating--unset-floating id))
+        (exwm-floating--set-floating id))
       (if (plist-get exwm--configurations 'char-mode)
           (exwm-input-release-keyboard id)
         (exwm-input-grab-keyboard id))

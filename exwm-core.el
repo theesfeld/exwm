@@ -89,6 +89,8 @@ nil: Disable timestamp."
 (declare-function exwm-input--on-KeyPress-line-mode "exwm-input.el"
                   (key-press raw-data))
 (declare-function exwm-floating-hide "exwm-floating.el")
+(declare-function exwm-floating-set-floating "exwm-floating.el")
+(declare-function exwm-floating-unset-floating "exwm-floating.el")
 (declare-function exwm-floating-toggle-floating "exwm-floating.el")
 (declare-function exwm-input-release-keyboard "exwm-input.el")
 (declare-function exwm-input-send-next-key "exwm-input.el" (times))
@@ -279,6 +281,8 @@ If CONN is non-nil, use it instead of the value of the variable
 (defvar-local exwm--saved-mode-line-format nil) ;save mode-line-format
 (defvar-local exwm--floating-frame-geometry nil) ;set when hidden.
 (defvar-local exwm--fixed-size nil)              ;fixed size
+(defvar-local exwm--stay-tiled nil
+  "Non-nil when manage configuration forbids this client from floating.")
 (defvar-local exwm--selected-input-mode 'line-mode
   "Input mode as selected by the user.
 One of `line-mode' or `char-mode'.")
@@ -361,6 +365,8 @@ One of `line-mode' or `char-mode'.")
     ("General"
      ["Run or raise" exwm-run-or-raise]
      ["Toggle floating" exwm-floating-toggle-floating]
+     ["Float window" exwm-floating-set-floating]
+     ["Tile window" exwm-floating-unset-floating]
      ["Toggle fullscreen mode" exwm-layout-toggle-fullscreen]
      ["Hide window" exwm-floating-hide exwm--floating-frame]
      ["Close window" (kill-buffer (current-buffer))])
