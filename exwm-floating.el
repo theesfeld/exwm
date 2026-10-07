@@ -23,6 +23,8 @@
 
 ;; This module deals with the conversion between floating and non-floating
 ;; states and implements moving/resizing operations on floating windows.
+;; An ordinary Emacs buffer floats in its own frame.  That path does not
+;; set `exwm--floating-frame', which means an X client.
 
 ;;; Code:
 
@@ -30,6 +32,18 @@
 (require 'exwm-core)
 
 (defvar exwm-manage--display-window)
+
+(defvar exwm-floating--emacs-frames nil
+  "Floating frames that display ordinary Emacs buffers.
+Each frame is reparented into an override-redirect container, the
+same arrangement as a floating X window.  The frame parameter
+`exwm-floating-emacs' is t.  `exwm--floating-frame' stays nil:
+that buffer-local variable means a managed X client.")
+
+(defconst exwm-floating--emacs-park -10000
+  "Root position used to park a floating Emacs frame.
+The frame is not resized.  The floating X window park of -101
+would leave most of a large frame on screen.")
 
 (defgroup exwm-floating nil
   "Floating."
@@ -91,6 +105,20 @@ With `exwm-floating-border-color-focused' nil, every window uses
                                    :window container
                                    :value-mask xcb:CW:BorderPixel
                                    :border-pixel pixel)))))))
+      (dolist (frame exwm-floating--emacs-frames)
+        (when (and (frame-live-p frame)
+                   (frame-parameter frame 'exwm-floating-emacs))
+          (let ((pixel (if (and focus-color
+                                (eq frame (selected-frame)))
+                           focus
+                         normal))
+                (container (frame-parameter frame 'exwm-container)))
+            (when (and pixel container)
+              (xcb:+request exwm--connection
+                  (make-instance 'xcb:ChangeWindowAttributes
+                                 :window container
+                                 :value-mask xcb:CW:BorderPixel
+                                 :border-pixel pixel))))))
       (xcb:flush exwm--connection))))
 
 (defcustom exwm-floating-border-width 1
@@ -125,6 +153,25 @@ With `exwm-floating-border-color-focused' nil, every window uses
                                       :border-width value
                                       :x (- x delta)
                                       :y (- y delta)))))))
+           (dolist (frame exwm-floating--emacs-frames)
+             (when (and exwm--connection
+                        (frame-live-p frame)
+                        (setq container (frame-parameter frame 'exwm-container)))
+               (let ((reply (xcb:+request-unchecked+reply
+                                exwm--connection
+                                (make-instance 'xcb:GetGeometry
+                                               :drawable container))))
+                 (when reply
+                   (with-slots (x y) reply
+                     (xcb:+request exwm--connection
+                         (make-instance 'xcb:ConfigureWindow
+                                        :window container
+                                        :value-mask (logior xcb:ConfigWindow:X
+                                                            xcb:ConfigWindow:Y
+                                                            xcb:ConfigWindow:BorderWidth)
+                                        :border-width value
+                                        :x (- x delta)
+                                        :y (- y delta))))))))
            (when exwm--connection
              (xcb:flush exwm--connection)))))
 
@@ -151,8 +198,11 @@ With `exwm-floating-border-color-focused' nil, every window uses
 (declare-function exwm-layout--iconic-state-p "exwm-layout.el" (&optional id))
 (declare-function exwm-layout--refresh "exwm-layout.el" ())
 (declare-function exwm-layout--show "exwm-layout.el" (id &optional window))
+(declare-function exwm-workspace--active-p "exwm-workspace.el" (frame))
 (declare-function exwm-workspace--position "exwm-workspace.el" (frame))
+(declare-function exwm-workspace--raise-child-frames "exwm-workspace.el" ())
 (declare-function exwm-workspace--workarea "exwm-workspace.el" (frame))
+(declare-function exwm-workspace--workspace-p "exwm-workspace.el" (frame))
 
 (defun exwm-floating--set-allowed-actions (id tiled-p)
   "Set _NET_WM_ALLOWED_ACTIONS for window with ID.
@@ -463,6 +513,418 @@ A buffer with `exwm--stay-tiled' set stays tiled unless
   (with-current-buffer (exwm--id->buffer id)
     (run-hooks 'exwm-floating-exit-hook)))
 
+(defun exwm-floating--emacs-container-geometry
+    (source-x source-y chrome-left chrome-top outer-width outer-height
+     area-x area-y area-width area-height)
+  "Return (X Y WIDTH HEIGHT) for a floating Emacs frame container.
+SOURCE-X and SOURCE-Y are the source window origin in root pixels.
+CHROME-LEFT and CHROME-TOP are the pixels between the outer frame
+and that window, so the window stays on the source.  OUTER-WIDTH
+and OUTER-HEIGHT are the frame's outer size.  When the area
+arguments are numbers, the origin moves so at least half of the
+container stays inside that workarea.  A container larger than
+the workarea is placed on the workarea origin."
+  (let ((x (- source-x (or chrome-left 0)))
+        (y (- source-y (or chrome-top 0)))
+        (width (max 1 (or outer-width 1)))
+        (height (max 1 (or outer-height 1))))
+    (when (and (numberp area-x) (numberp area-y)
+               (numberp area-width) (numberp area-height)
+               (> area-width 0) (> area-height 0))
+      (if (> width area-width)
+          (setq x area-x)
+        (unless (< area-x (+ x (/ width 2)) (+ area-x area-width))
+          (setq x (+ area-x (/ (- area-width width) 2)))))
+      (if (> height area-height)
+          (setq y area-y)
+        (unless (< area-y (+ y (/ height 2)) (+ area-y area-height))
+          (setq y (+ area-y (/ (- area-height height) 2))))))
+    (list x y width height)))
+
+(defun exwm-floating--emacs-park-geometry (x y width height saved)
+  "Return the geometry list to keep when parking a frame.
+SAVED is an existing (X Y WIDTH HEIGHT) list and wins, so a park
+echo cannot replace the on-screen position.  A 1x1 rectangle is
+the floating X window park size and is not a frame position.
+Return nil when there is nothing to store."
+  (or saved
+      (and (numberp x) (numberp y) (numberp width) (numberp height)
+           (> width 1) (> height 1)
+           (not (and (= x exwm-floating--emacs-park)
+                     (= y exwm-floating--emacs-park)))
+           (list x y width height))))
+
+(defun exwm-floating--emacs-frame-showing (buffer)
+  "Return a floating Emacs frame that shows BUFFER, or nil."
+  (catch 'found
+    (dolist (frame exwm-floating--emacs-frames)
+      (when (and (frame-live-p frame)
+                 (frame-parameter frame 'exwm-floating-emacs)
+                 (get-buffer-window buffer frame))
+        (throw 'found frame)))))
+
+(defun exwm-floating--buffer-workspace ()
+  "Return the workspace that should own a new floating Emacs frame."
+  (let ((frame (window-frame (selected-window))))
+    (cond
+     ((exwm-workspace--workspace-p frame) frame)
+     ((frame-parameter frame 'exwm-floating-workspace))
+     (t exwm-workspace--current))))
+
+(defun exwm-floating--measure-frame (frame)
+  "Return (CHROME-LEFT CHROME-TOP OUTER-WIDTH OUTER-HEIGHT) for FRAME.
+Call this before the frame is reparented into its container.
+After that reparent, `frame-edges' walks up to the container and
+no longer describes the Emacs window."
+  (let ((outer (frame-edges frame 'outer-edges))
+        (text (window-absolute-pixel-edges (frame-first-window frame))))
+    (when (and (consp outer) (consp text))
+      (list (max 0 (- (nth 0 text) (nth 0 outer)))
+            (max 0 (- (nth 1 text) (nth 1 outer)))
+            (max 1 (- (nth 2 outer) (nth 0 outer)))
+            (max 1 (- (nth 3 outer) (nth 1 outer)))))))
+
+(defun exwm-floating--fit-emacs-container (frame)
+  "Give FRAME's container the same size as FRAME's outer X window.
+The container position is left alone.  The size is read from the
+Emacs window, not from `frame-outer-width': after the reparent,
+that walks up to the container and would not track a resize."
+  (when (and exwm--connection (frame-live-p frame))
+    (let ((container (frame-parameter frame 'exwm-container))
+          (outer (frame-parameter frame 'exwm-outer-id)))
+      (when (and container outer)
+        (let ((child (xcb:+request-unchecked+reply
+                         exwm--connection
+                         (make-instance 'xcb:GetGeometry :drawable outer)))
+              (parent (xcb:+request-unchecked+reply
+                          exwm--connection
+                          (make-instance 'xcb:GetGeometry
+                                         :drawable container))))
+          (when (and child parent
+                     (or (/= (slot-value child 'width)
+                             (slot-value parent 'width))
+                         (/= (slot-value child 'height)
+                             (slot-value parent 'height))))
+            (exwm--set-geometry container nil nil
+                                (max 1 (slot-value child 'width))
+                                (max 1 (slot-value child 'height)))
+            (xcb:flush exwm--connection)))))))
+
+(defun exwm-floating--park-emacs-frame (frame)
+  "Move FRAME's container off screen without resizing it.
+The on-screen geometry is kept in `exwm-floating-emacs-geometry'."
+  (when (and exwm--connection (frame-live-p frame))
+    (let ((container (frame-parameter frame 'exwm-container)))
+      (when container
+        (let* ((reply (xcb:+request-unchecked+reply
+                          exwm--connection
+                          (make-instance 'xcb:GetGeometry
+                                         :drawable container)))
+               (saved (and reply
+                           (exwm-floating--emacs-park-geometry
+                            (slot-value reply 'x)
+                            (slot-value reply 'y)
+                            (slot-value reply 'width)
+                            (slot-value reply 'height)
+                            (frame-parameter frame
+                                             'exwm-floating-emacs-geometry)))))
+          (when saved
+            (set-frame-parameter frame 'exwm-floating-emacs-geometry saved)
+            (exwm--set-geometry container
+                                exwm-floating--emacs-park
+                                exwm-floating--emacs-park
+                                nil nil)))))))
+
+(defun exwm-floating--unpark-emacs-frame (frame)
+  "Restore FRAME from `exwm-floating-emacs-geometry' and fit it."
+  (when (and exwm--connection (frame-live-p frame))
+    (let ((container (frame-parameter frame 'exwm-container))
+          (saved (frame-parameter frame 'exwm-floating-emacs-geometry)))
+      (when (and container (consp saved))
+        (exwm--set-geometry container
+                            (nth 0 saved) (nth 1 saved)
+                            (nth 2 saved) (nth 3 saved))
+        (set-frame-parameter frame 'exwm-floating-emacs-geometry nil))
+      (exwm-floating--fit-emacs-container frame))))
+
+(defun exwm-floating--sync-workspace (workspace active)
+  "Park or restore floating Emacs frames that belong to WORKSPACE.
+ACTIVE non-nil restores them.  A frame on another workspace is
+left where it is, including one whose monitor stays active."
+  (when exwm--connection
+    (dolist (frame (copy-sequence exwm-floating--emacs-frames))
+      (cond
+       ((not (frame-live-p frame))
+        (setq exwm-floating--emacs-frames
+              (delq frame exwm-floating--emacs-frames)))
+       ((eq (frame-parameter frame 'exwm-floating-workspace) workspace)
+        (if active
+            (exwm-floating--unpark-emacs-frame frame)
+          (exwm-floating--park-emacs-frame frame)))))
+    (xcb:flush exwm--connection)))
+
+(defun exwm-floating--refresh-emacs-frame (frame)
+  "Fit FRAME, or park it when its workspace is hidden.
+`exwm-layout--refresh-floating' calls this.  There is no X
+client to show."
+  (when (and (frame-live-p frame)
+             (frame-parameter frame 'exwm-floating-emacs))
+    (let ((workspace (frame-parameter frame 'exwm-floating-workspace)))
+      (if (and (frame-live-p workspace)
+               (not (exwm-workspace--active-p workspace)))
+          (exwm-floating--park-emacs-frame frame)
+        (exwm-floating--unpark-emacs-frame frame))
+      (when exwm--connection
+        (xcb:flush exwm--connection)))))
+
+(defun exwm-floating--raise-emacs-frame (frame)
+  "Raise FRAME's container, then raise child frames above it."
+  (when (and exwm--connection
+             (frame-live-p frame)
+             (frame-parameter frame 'exwm-floating-emacs))
+    (let ((container (frame-parameter frame 'exwm-container)))
+      (when container
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:ConfigureWindow
+                           :window container
+                           :value-mask xcb:ConfigWindow:StackMode
+                           :stack-mode xcb:StackMode:Above))
+        (exwm-workspace--raise-child-frames)))))
+
+(defun exwm-floating--teardown-emacs-frame (frame &optional release)
+  "Destroy FRAME's floating container and forget FRAME.
+The frame itself is not deleted.  When RELEASE is non-nil, EXWM
+is exiting: reparent the frame to the root and clear
+override-redirect.  A user unfloat leaves the window unmapped
+and then deletes the frame.  Clearing `exwm-floating-emacs'
+first makes a nested `delete-frame' hook a no-op."
+  (setq exwm-floating--emacs-frames
+        (delq frame exwm-floating--emacs-frames))
+  (when (frame-live-p frame)
+    (let ((container (frame-parameter frame 'exwm-container))
+          (outer (or (frame-parameter frame 'exwm-outer-id)
+                     (let ((id (frame-parameter frame 'outer-window-id)))
+                       (and (stringp id) (string-to-number id))))))
+      (set-frame-parameter frame 'exwm-floating-emacs nil)
+      (set-frame-parameter frame 'exwm-container nil)
+      (set-frame-parameter frame 'exwm-outer-id nil)
+      (set-frame-parameter frame 'exwm-floating-workspace nil)
+      (set-frame-parameter frame 'exwm-floating-emacs-geometry nil)
+      (when (and container outer exwm--connection
+                 (slot-value exwm--connection 'connected))
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:UnmapWindow :window outer))
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:ReparentWindow
+                           :window outer
+                           :parent exwm--root
+                           :x 0
+                           :y 0))
+        (when release
+          (xcb:+request exwm--connection
+              (make-instance 'xcb:ChangeWindowAttributes
+                             :window outer
+                             :value-mask xcb:CW:OverrideRedirect
+                             :override-redirect 0))
+          (xcb:+request exwm--connection
+              (make-instance 'xcb:MapWindow :window outer)))
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:DestroyWindow :window container))
+        (xcb:flush exwm--connection)))))
+
+(defun exwm-floating--on-delete-frame (frame)
+  "Destroy FRAME's container when the user deletes the frame."
+  (when (and (frame-live-p frame)
+             (frame-parameter frame 'exwm-floating-emacs))
+    (exwm-floating--teardown-emacs-frame frame)))
+
+(defun exwm-floating--move-emacs-frame (frame delta-x delta-y)
+  "Move floating Emacs FRAME by DELTA-X and DELTA-Y pixels.
+Only the container moves.  The frame is its child at 0, 0."
+  (when (and exwm--connection
+             (not (and (= 0 delta-x) (= 0 delta-y))))
+    (let* ((container (frame-parameter frame 'exwm-container))
+           (geometry (and container
+                          (xcb:+request-unchecked+reply
+                              exwm--connection
+                              (make-instance 'xcb:GetGeometry
+                                             :drawable container)))))
+      (when geometry
+        (let ((saved (frame-parameter frame 'exwm-floating-emacs-geometry)))
+          (if (consp saved)
+              ;; The container is parked.  Remember the new on-screen
+              ;; position and leave the parked window where it is.
+              (set-frame-parameter
+               frame 'exwm-floating-emacs-geometry
+               (list (+ (nth 0 saved) delta-x)
+                     (+ (nth 1 saved) delta-y)
+                     (nth 2 saved)
+                     (nth 3 saved)))
+            (with-slots (x y) geometry
+              (exwm--set-geometry container
+                                  (+ x delta-x) (+ y delta-y) nil nil)
+              (exwm-workspace--raise-child-frames))))))))
+
+(defun exwm-floating--resize-emacs-frame (frame delta-width delta-height)
+  "Resize floating Emacs FRAME by DELTA-WIDTH and DELTA-HEIGHT.
+`set-frame-size' pixelwise changes the text area, so the delta is
+applied to the text size.  The container then follows the Emacs
+window."
+  (unless (and (= 0 delta-width) (= 0 delta-height))
+    (set-frame-size frame
+                    (max 1 (+ (frame-text-width frame) delta-width))
+                    (max 1 (+ (frame-text-height frame) delta-height))
+                    t)
+    (exwm-floating--fit-emacs-container frame)))
+
+(defun exwm-floating--set-emacs-frame ()
+  "Show the current buffer in a floating frame.
+The frame is the content.  It is reparented into a container that
+provides the floating border.  This does not call
+`exwm-floating--set-floating', which requires an X window id."
+  (unless (and exwm--connection
+               (slot-value exwm--connection 'connected))
+    (user-error "[EXWM] Not running as a window manager"))
+  (when (minibufferp)
+    (user-error "[EXWM] Cannot float the minibuffer"))
+  (let* ((buffer (current-buffer))
+         (source (selected-window))
+         (edges (window-absolute-pixel-edges source))
+         (source-x (nth 0 edges))
+         (source-y (nth 1 edges))
+         (text-width (max 1 (window-body-width source t)))
+         (text-height (max 1 (window-body-height source t)))
+         (workspace (exwm-floating--buffer-workspace))
+         (minibuffer-frame (or workspace (selected-frame)))
+         (frame (make-frame
+                 `((minibuffer . ,(minibuffer-window minibuffer-frame))
+                   (tab-bar-lines . 0)
+                   (tab-bar-lines-keep-state . t)
+                   ;; Off-screen until the container exists, same as
+                   ;; `exwm-floating--set-floating'.  Do not apply this
+                   ;; position again after the reparent: it would then
+                   ;; be relative to the container.
+                   (left . ,(* window-min-width -10000))
+                   (top . ,(* window-min-height -10000))
+                   (width . (text-pixels . ,text-width))
+                   (height . (text-pixels . ,text-height))
+                   (unsplittable . t)
+                   (exwm-floating-emacs . t)
+                   (exwm-floating-workspace . ,workspace))))
+         (window (frame-first-window frame))
+         (outer-id (string-to-number
+                    (frame-parameter frame 'outer-window-id)))
+         (window-id (string-to-number
+                     (frame-parameter frame 'window-id)))
+         (container (xcb:generate-id exwm--connection))
+         (border-pixel (exwm--color->pixel exwm-floating-border-color))
+         (border-width exwm-floating-border-width)
+         success)
+    (set-window-buffer window buffer)
+    (set-window-parameter
+     window 'split-window
+     (lambda (&rest _) (user-error "Floating window cannot be split")))
+    (when (and (window-live-p source)
+               (not (eq source window))
+               (eq (window-buffer source) buffer))
+      (with-selected-window source
+        (if (window-prev-buffers source)
+            (switch-to-prev-buffer source)
+          (switch-to-next-buffer source))))
+    ;; The frame must be realized before its edges are meaningful.
+    (redisplay)
+    (modify-frame-parameters
+     frame `((exwm-outer-id . ,outer-id)
+             (exwm-id . ,window-id)))
+    (setq exwm-floating--emacs-frames
+          (cons frame exwm-floating--emacs-frames))
+    (unwind-protect
+        (let* ((measured (or (exwm-floating--measure-frame frame)
+                             (list 0 0 text-width text-height)))
+               (workarea (and (frame-live-p workspace)
+                              (exwm-workspace--position workspace)
+                              (exwm-workspace--workarea workspace)))
+               (geometry (exwm-floating--emacs-container-geometry
+                          source-x source-y
+                          (nth 0 measured) (nth 1 measured)
+                          (nth 2 measured) (nth 3 measured)
+                          (and workarea (slot-value workarea 'x))
+                          (and workarea (slot-value workarea 'y))
+                          (and workarea (slot-value workarea 'width))
+                          (and workarea (slot-value workarea 'height))))
+               (x (nth 0 geometry))
+               (y (nth 1 geometry))
+               (width (nth 2 geometry))
+               (height (nth 3 geometry))
+               (hidden (and (frame-live-p workspace)
+                            (not (exwm-workspace--active-p workspace)))))
+          (xcb:+request exwm--connection
+              (make-instance 'xcb:CreateWindow
+                             :depth 0
+                             :wid container
+                             :parent exwm--root
+                             :x x
+                             :y y
+                             :width width
+                             :height height
+                             :border-width border-width
+                             :class xcb:WindowClass:InputOutput
+                             :visual 0
+                             :value-mask (logior xcb:CW:BackPixmap
+                                                 (if border-pixel
+                                                     xcb:CW:BorderPixel 0)
+                                                 xcb:CW:OverrideRedirect)
+                             :background-pixmap xcb:BackPixmap:ParentRelative
+                             :border-pixel border-pixel
+                             :override-redirect 1))
+          ;; Set this only after the CreateWindow is queued, so a
+          ;; failure earlier does not destroy an id that was never used.
+          (set-frame-parameter frame 'exwm-container container)
+          (xcb:+request exwm--connection
+              (make-instance 'xcb:ewmh:set-_NET_WM_NAME
+                             :window container
+                             :data "EXWM floating Emacs frame"))
+          (xcb:+request exwm--connection
+              (make-instance 'xcb:MapWindow :window container))
+          (xcb:+request exwm--connection
+              (make-instance 'xcb:ReparentWindow
+                             :window outer-id
+                             :parent container
+                             :x 0
+                             :y 0))
+          (when hidden
+            (exwm-floating--park-emacs-frame frame))
+          (xcb:flush exwm--connection)
+          (unless hidden
+            (exwm-floating--raise-emacs-frame frame)
+            (unless exwm-manage--display-window
+              (select-frame-set-input-focus frame)))
+          (when exwm-floating-border-color-focused
+            (exwm-floating-refresh-borders))
+          (setq success t))
+      (unless success
+        (exwm-floating--teardown-emacs-frame frame)
+        (when (frame-live-p frame)
+          (delete-frame frame))))))
+
+(defun exwm-floating--unset-emacs-frame (frame)
+  "Put FRAME's buffer back on its workspace and delete FRAME."
+  (let* ((window (and (frame-live-p frame)
+                      (frame-selected-window frame)))
+         (buffer (and window (window-buffer window)))
+         (workspace (or (and (frame-live-p frame)
+                             (frame-parameter frame 'exwm-floating-workspace))
+                        exwm-workspace--current)))
+    (when (and (not exwm-manage--display-window)
+               (frame-live-p workspace))
+      (select-frame workspace))
+    (exwm-floating--teardown-emacs-frame frame)
+    (when (frame-live-p frame)
+      (delete-frame frame))
+    (when (and (not exwm-manage--display-window)
+               (buffer-live-p buffer))
+      (pop-to-buffer buffer))))
+
 ;;;###autoload
 (defun exwm-floating-set-floating ()
   "Float the current X window.
@@ -486,14 +948,29 @@ to stay tiled."
 
 ;;;###autoload
 (defun exwm-floating-toggle-floating ()
-  "Toggle the current window between floating and non-floating states."
+  "Toggle floating for the current X window or Emacs buffer.
+An X window uses its managed floating frame.  Any other buffer is
+shown in a floating frame with the same border as a floating X
+window.  Calling this from that frame, or on a buffer already
+shown there, puts the buffer back on its workspace.
+
+The key binding is on `exwm-mode-map' only.  From an ordinary
+buffer, use \\[exwm-floating-toggle-floating]."
   (interactive)
   (exwm--log)
-  (unless (derived-mode-p 'exwm-mode)
-    (user-error "[EXWM] No managed X window"))
-  (if exwm--floating-frame
-      (exwm-floating-unset-floating)
-    (exwm-floating-set-floating)))
+  (cond
+   ((derived-mode-p 'exwm-mode)
+    (if exwm--floating-frame
+        (exwm-floating-unset-floating)
+      (exwm-floating-set-floating)))
+   ((and (frame-live-p (selected-frame))
+         (frame-parameter (selected-frame) 'exwm-floating-emacs))
+    (exwm-floating--unset-emacs-frame (selected-frame)))
+   (t
+    (let ((existing (exwm-floating--emacs-frame-showing (current-buffer))))
+      (if existing
+          (exwm-floating--unset-emacs-frame existing)
+        (exwm-floating--set-emacs-frame))))))
 
 ;;;###autoload
 (defun exwm-floating-hide ()
@@ -779,25 +1256,30 @@ Float resizing is stopped when TYPE is nil."
 
 Both DELTA-X and DELTA-Y default to 1.  This command should be bound locally."
   (exwm--log "delta-x: %s, delta-y: %s" delta-x delta-y)
-  (unless (and (derived-mode-p 'exwm-mode) exwm--floating-frame)
-    (user-error "[EXWM] `exwm-floating-move' is only for floating X windows"))
   (unless delta-x (setq delta-x 1))
   (unless delta-y (setq delta-y 1))
-  (unless (and (= 0 delta-x) (= 0 delta-y))
-    (let* ((floating-container (frame-parameter exwm--floating-frame
-                                                'exwm-container))
-           (geometry (xcb:+request-unchecked+reply exwm--connection
-                         (make-instance 'xcb:GetGeometry
-                                        :drawable floating-container)))
-           (edges (exwm--window-inside-absolute-pixel-edges)))
-      (with-slots (x y) geometry
-        (exwm--set-geometry floating-container
-                            (+ x delta-x) (+ y delta-y) nil nil))
-      (exwm--set-geometry exwm--id
-                          (+ (pop edges) delta-x)
-                          (+ (pop edges) delta-y)
-                          nil nil))
-    (xcb:flush exwm--connection)))
+  (cond
+   ((and (derived-mode-p 'exwm-mode) exwm--floating-frame)
+    (unless (and (= 0 delta-x) (= 0 delta-y))
+      (let* ((floating-container (frame-parameter exwm--floating-frame
+                                                  'exwm-container))
+             (geometry (xcb:+request-unchecked+reply exwm--connection
+                           (make-instance 'xcb:GetGeometry
+                                          :drawable floating-container)))
+             (edges (exwm--window-inside-absolute-pixel-edges)))
+        (with-slots (x y) geometry
+          (exwm--set-geometry floating-container
+                              (+ x delta-x) (+ y delta-y) nil nil))
+        (exwm--set-geometry exwm--id
+                            (+ (pop edges) delta-x)
+                            (+ (pop edges) delta-y)
+                            nil nil)
+        (xcb:flush exwm--connection))))
+   ((and (frame-live-p (selected-frame))
+         (frame-parameter (selected-frame) 'exwm-floating-emacs))
+    (exwm-floating--move-emacs-frame (selected-frame) delta-x delta-y))
+   (t
+    (user-error "[EXWM] `exwm-floating-move' is only for floating X windows"))))
 
 (defun exwm-floating--keyboard-delta (n)
   "Return N steps of `exwm-floating-keyboard-step', in pixels."
@@ -825,15 +1307,21 @@ Both DELTA-X and DELTA-Y default to 1.  This command should be bound locally."
 
 (defun exwm-floating-resize (delta-width delta-height)
   "Grow the floating window by DELTA-WIDTH and DELTA-HEIGHT pixels."
-  (unless (and (derived-mode-p 'exwm-mode) exwm--floating-frame)
-    (user-error "[EXWM] `exwm-floating-resize' is only for floating X windows"))
-  (unless (and (= 0 delta-width) (= 0 delta-height))
-    (set-frame-size exwm--floating-frame
-                    (max 1 (+ (frame-pixel-width exwm--floating-frame)
-                              delta-width))
-                    (max 1 (+ (frame-pixel-height exwm--floating-frame)
-                              delta-height))
-                    t)))
+  (cond
+   ((and (derived-mode-p 'exwm-mode) exwm--floating-frame)
+    (unless (and (= 0 delta-width) (= 0 delta-height))
+      (set-frame-size exwm--floating-frame
+                      (max 1 (+ (frame-pixel-width exwm--floating-frame)
+                                delta-width))
+                      (max 1 (+ (frame-pixel-height exwm--floating-frame)
+                                delta-height))
+                      t)))
+   ((and (frame-live-p (selected-frame))
+         (frame-parameter (selected-frame) 'exwm-floating-emacs))
+    (exwm-floating--resize-emacs-frame
+     (selected-frame) delta-width delta-height))
+   (t
+    (user-error "[EXWM] `exwm-floating-resize' is only for floating X windows"))))
 
 (defun exwm-floating-grow-width (&optional n)
   "Grow the floating window width by N steps."
@@ -858,6 +1346,12 @@ Both DELTA-X and DELTA-Y default to 1.  This command should be bound locally."
 (defun exwm-floating--init ()
   "Initialize floating module."
   (exwm--log)
+  (add-hook 'delete-frame-functions #'exwm-floating--on-delete-frame)
+  (dolist (param '(exwm-floating-emacs
+                   exwm-floating-workspace
+                   exwm-floating-emacs-geometry))
+    (unless (assq param frameset-filter-alist)
+      (push (cons param :never) frameset-filter-alist)))
   ;; Initialize cursors for moving/resizing a window
   (setq exwm-floating--cursor-move
         (xcb:cursor:load-cursor exwm--connection "fleur")
@@ -880,7 +1374,13 @@ Both DELTA-X and DELTA-Y default to 1.  This command should be bound locally."
 
 (defun exwm-floating--exit ()
   "Exit the floating module."
-  (exwm--log))
+  (exwm--log)
+  (remove-hook 'delete-frame-functions #'exwm-floating--on-delete-frame)
+  ;; The connection is still open here.  Drop the containers and
+  ;; leave the frames as ordinary X windows.
+  (dolist (frame (copy-sequence exwm-floating--emacs-frames))
+    (exwm-floating--teardown-emacs-frame frame 'release))
+  (setq exwm-floating--emacs-frames nil))
 
 (provide 'exwm-floating)
 ;;; exwm-floating.el ends here

@@ -447,17 +447,23 @@ Show PROMPT to the user if non-nil."
   (exwm--log "%s" exwm-workspace--workareas)
   (run-hooks 'exwm-workspace--update-workareas-hook))
 
+(declare-function exwm-floating--sync-workspace "exwm-floating.el"
+                  (workspace active))
+
 (defun exwm-workspace--set-active (frame active)
   "Make frame FRAME active on its monitor.
 ACTIVE indicates whether to set the frame active or inactive."
   (exwm--log "active=%s; frame=%s" active frame)
   (set-frame-parameter frame 'exwm-active active)
+  ;; Floating Emacs frames are root windows.  Park or restore them
+  ;; before child frames are raised, so a popup follows its frame
+  ;; rather than the parked position.  Shrinking the workspace
+  ;; container below does not hide either of them.
+  (exwm-floating--sync-workspace frame active)
   (if active
       (exwm-workspace--set-fullscreen frame)
     (exwm--set-geometry (frame-parameter frame 'exwm-container) nil nil 1 1))
   (exwm-layout--refresh frame)
-  ;; Park child frames of a workspace that just became inactive, and
-  ;; put them back when it is shown again.
   (exwm-workspace--raise-child-frames)
   (xcb:flush exwm--connection))
 
@@ -1227,9 +1233,11 @@ yields 0."
      ((exwm-workspace--workspace-p root) root)
      ((and (frame-live-p root)
            (frame-parameter root 'exwm-container))
-      (let ((buffer (window-buffer (frame-selected-window root))))
-        (when (buffer-live-p buffer)
-          (buffer-local-value 'exwm--frame buffer)))))))
+      (or (let ((workspace (frame-parameter root 'exwm-floating-workspace)))
+            (and (frame-live-p workspace) workspace))
+          (let ((buffer (window-buffer (frame-selected-window root))))
+            (when (buffer-live-p buffer)
+              (buffer-local-value 'exwm--frame buffer))))))))
 
 (defun exwm-workspace--child-frame-hidden-p (frame)
   "Non-nil when FRAME's workspace is not active."
