@@ -464,6 +464,39 @@ until the selected window stops changing (debouncing input focus updates)."
                         nil
                         #'exwm-input--update-focus-commit)))
 
+(defun exwm-input--other-window-x-id ()
+  "Return the X window id in the other window, or nil.
+Signal the same error as `scroll-other-window' when there is no other
+window."
+  (let ((window (other-window-for-scrolling)))
+    (when (window-live-p window)
+      (with-current-buffer (window-buffer window)
+        (and (derived-mode-p 'exwm-mode) exwm--id)))))
+
+(defun exwm-input-scroll-other-window (&optional arg)
+  "Scroll the other window, or page an X client shown there.
+ARG is passed to `scroll-other-window' for an ordinary buffer.
+A negative ARG sends Prior to an X client.  Any other ARG sends Next."
+  (interactive "P")
+  (let ((id (exwm-input--other-window-x-id)))
+    (if id
+        (exwm-input--fake-key
+         (if (and arg (< (prefix-numeric-value arg) 0))
+             'prior
+           'next)
+         id)
+      (scroll-other-window arg))))
+
+(defun exwm-input-scroll-other-window-down (&optional arg)
+  "Scroll the other window down, or page an X client up.
+ARG is passed to `scroll-other-window-down' for an ordinary buffer.
+An X client receives Prior."
+  (interactive "P")
+  (let ((id (exwm-input--other-window-x-id)))
+    (if id
+        (exwm-input--fake-key 'prior id)
+      (scroll-other-window-down arg))))
+
 (defun exwm-input-refresh-focus ()
   "Schedule input focus for the selected window.
 `exwm-workspace-switch' does this itself.  Call this after another
@@ -1218,19 +1251,20 @@ lifted first: line-mode's grab would otherwise consume the keys."
           (exwm-input--xtest-sync))
       (exwm-input--xtest-restore-grabs id))))
 
-(defun exwm-input--fake-key (event)
+(defun exwm-input--fake-key (event &optional id)
   "Fake a key event equivalent to Emacs event EVENT.
 XTEST is used when the server supports it, because clients such as
 GTK 4 and Wine ignore events sent with SendEvent.  SendEvent remains
-the fallback."
+the fallback.  ID is the target X window; it defaults to the selected
+window's client."
   (let* ((keysyms (xcb:keysyms:event->keysyms exwm--connection event))
-         keycode id)
+         keycode)
     (when (= 0 (caar keysyms))
       (user-error "[EXWM] Invalid key: %s" (single-key-description event)))
     (setq keycode (xcb:keysyms:keysym->keycode exwm--connection
                                                (caar keysyms)))
     (when (/= 0 keycode)
-      (setq id (exwm--buffer->id (window-buffer (selected-window))))
+      (setq id (or id (exwm--buffer->id (window-buffer (selected-window)))))
       (exwm--log "id=#x%x event=%s keycode=%s xtest=%s"
                  id event keycode exwm-input--xtest)
       (if (and exwm-input--xtest id)
@@ -1560,7 +1594,13 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
   (add-hook 'pre-command-hook #'exwm-input--clear-pointer-focus)
 
   (dolist (fun exwm-input--passthrough-functions)
-    (advice-add fun :around #'exwm-input--call-with-passthrough)))
+    (advice-add fun :around #'exwm-input--call-with-passthrough))
+  ;; C-M-v from an ordinary Emacs window.  The exwm-mode-map binding
+  ;; covers line-mode, where an unbound key would go to the client.
+  (define-key global-map [remap scroll-other-window]
+              #'exwm-input-scroll-other-window)
+  (define-key global-map [remap scroll-other-window-down]
+              #'exwm-input-scroll-other-window-down))
 
 (defun exwm-input--post-init ()
   "The second stage in the initialization of the input module."
@@ -1585,6 +1625,8 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
   (advice-remove 'mouse-autoselect-window-select
                  #'exwm-input--note-pointer-focus)
   (remove-hook 'pre-command-hook #'exwm-input--clear-pointer-focus)
+  (define-key global-map [remap scroll-other-window] nil)
+  (define-key global-map [remap scroll-other-window-down] nil)
   (setq exwm-input--pointer-focus-until nil)
   (when exwm-input--update-focus-timer
     (cancel-timer exwm-input--update-focus-timer))
