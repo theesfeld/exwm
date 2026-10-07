@@ -129,6 +129,9 @@ After this time, the server will be killed.")
 
 (defvar exwm--server-process nil "Process of the subordinate Emacs server.")
 
+(defvar exwm--java-nonreparenting-set nil
+  "Non-nil if EXWM set `_JAVA_AWT_WM_NONREPARENTING'.")
+
 (defvar exwm--client-message-functions nil
   "Alist of form ((MESSAGE . MESSAGE-HANDLER)...).
 Set during `exwm--init'.")
@@ -1127,6 +1130,9 @@ FRAME, if given, indicates the X display EXWM should manage."
   (exwm--log)
   (setq x-no-window-manager nil)
   (setenv "INSIDE_EXWM" nil)
+  (when exwm--java-nonreparenting-set
+    (setenv "_JAVA_AWT_WM_NONREPARENTING" nil)
+    (setq exwm--java-nonreparenting-set nil))
   (remove-hook 'window-setup-hook #'exwm--init)
   (remove-hook 'after-make-frame-functions #'exwm--init)
   (remove-hook 'kill-emacs-hook #'exwm--server-stop)
@@ -1140,6 +1146,11 @@ FRAME, if given, indicates the X display EXWM should manage."
         window-resize-pixelwise t
         x-no-window-manager t)
   (setenv "INSIDE_EXWM" "1")
+  ;; A non-reparenting window manager.  Do not replace a value the user set,
+  ;; including "0".
+  (unless (getenv "_JAVA_AWT_WM_NONREPARENTING")
+    (setenv "_JAVA_AWT_WM_NONREPARENTING" "1")
+    (setq exwm--java-nonreparenting-set t))
   (if (eq initial-window-system 'x)
       ;; In case EXWM is to be started from a graphical Emacs instance.
       (add-hook 'window-setup-hook #'exwm--init t)
