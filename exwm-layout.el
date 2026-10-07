@@ -444,7 +444,8 @@ If FRAME is nil, refresh layout of selected frame."
                    ;; It may be a buffer waiting to be killed.
                    (exwm--id->buffer exwm--id))
           (exwm--log "Refresh floating window #x%x" exwm--id)
-          (if (exwm-workspace--active-p exwm--frame)
+          (if (and (exwm-workspace--active-p exwm--frame)
+                   (not (exwm-layout--iconic-state-p)))
               (exwm-layout--show exwm--id window)
             (exwm-layout--hide exwm--id)))))))
 
@@ -485,7 +486,9 @@ If FRAME is nil, refresh layout of selected frame."
               (let ((window (car windows)))
                 (if (eq frame exwm--frame)
                     ;; Show it if `frame' is active, hide otherwise.
-                    (if (exwm-workspace--active-p frame)
+                    ;; An iconic client stays hidden until it is selected.
+                    (if (and (exwm-workspace--active-p frame)
+                             (not (exwm-layout--iconic-state-p)))
                         (exwm-layout--show exwm--id window)
                       (exwm-layout--hide exwm--id))
                   ;; It was last shown in other workspace; move it here.

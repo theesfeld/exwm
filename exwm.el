@@ -796,12 +796,16 @@ DATA contains unmarshalled PropertyNotify event data."
                (= (elt data 0) xcb:icccm:WM_STATE:IconicState))
       (with-current-buffer buffer
         (if exwm--floating-frame
-            (call-interactively #'exwm-floating-hide)
-          ;; We can't simply bury the buffer because it may be in an unselected
-          ;; window, or even a different frame/workspace.
-          (replace-buffer-in-windows)))
-      ;; We bury the buffer even if it's floating to ensure it goes to the
-      ;; back of the buffer switch list.
+            (exwm-floating-hide)
+          ;; A dedicated window keeps this buffer, so the X window stays
+          ;; mapped on top of it.  Show something else, then unmap.
+          (replace-buffer-in-windows buffer)
+          (dolist (window (get-buffer-window-list buffer nil t))
+            (set-window-dedicated-p window nil)
+            (set-window-buffer window (or (other-buffer buffer t)
+                                          (get-buffer-create "*scratch*"))))
+          (exwm-layout--hide id)))
+      ;; Bury it so the next buffer command does not land on it.
       (bury-buffer buffer))))
 
 (defvar exwm-manage--_NET_STARTUP_INFO)
