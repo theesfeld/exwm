@@ -49,6 +49,20 @@ This happens when a workspace is added, deleted, moved, etc."
   "Non-nil to warp cursor automatically after workspace switch."
   :type 'boolean)
 
+(defcustom exwm-workspace-show-mode-line nil
+  "When non-nil, show the current workspace in the mode-line.
+The construct is `exwm-workspace-mode-line'.  Nil does not change
+`global-mode-string'.  Mouse-1 on the indicator opens a menu to
+switch, add, delete, move, swap, or rename."
+  :type 'boolean
+  :initialize #'custom-initialize-default
+  :set #'exwm-workspace--set-mode-line)
+
+(defvar exwm-workspace-mode-line '(:eval (exwm-workspace--mode-line-text))
+  "Mode-line construct for the current workspace.
+Put this in `mode-line-format' or `global-mode-string', or set
+`exwm-workspace-show-mode-line'.")
+
 (defcustom exwm-workspace-number 1
   "Initial number of workspaces."
   :type 'integer)
@@ -714,6 +728,7 @@ When FORCE is true, allow switching to current workspace."
                                               (concat " " name)))))))
       ;; Update demands attention flag
       (set-frame-parameter frame 'exwm-urgency nil)
+      (exwm-workspace--publish-desktops)
       ;; Update switch workspace history
       (setq exwm-workspace--switch-history-outdated t)
       ;; Set _NET_CURRENT_DESKTOP
@@ -819,6 +834,7 @@ Passing a workspace frame as the first option is for internal use only."
         (set-frame-parameter exwm-workspace--current 'exwm-selected-window
                              (selected-window))
         (exwm-workspace-switch exwm-workspace--current t))
+      (exwm-workspace--publish-desktops)
       (run-hooks 'exwm-workspace-list-change-hook))))
 
 (defun exwm-workspace-move (workspace nth)
@@ -865,6 +881,7 @@ before it."
         (set-frame-parameter exwm-workspace--current 'exwm-selected-window
                              (selected-window))
         (exwm-workspace-switch exwm-workspace--current t))
+      (exwm-workspace--publish-desktops)
       (run-hooks 'exwm-workspace-list-change-hook))))
 
 (defun exwm-workspace-add (&optional index)
@@ -897,6 +914,190 @@ INDEX must not exceed the current number of workspaces."
             (set-frame-parameter f 'minibuffer newminibuf)))
         (delete-frame frame))
     (error "All other workspaces are active")))
+
+(defun exwm-workspace--format-label (index name urgent)
+  "Return the indicator text for workspace INDEX named NAME.
+URGENT non-nil marks the workspace.  An empty NAME shows only
+the index."
+  (let ((label (if (and (stringp name) (not (string-empty-p name)))
+                   (format "%d:%s" index name)
+                 (format "%d" index))))
+    (if urgent
+        (concat label "!")
+      label)))
+
+(defun exwm-workspace--format-desktop-names (names)
+  "Return a _NET_DESKTOP_NAMES value for NAMES.
+NAMES is a list of strings or nil, in global workspace order.
+Each entry is null-terminated, including the last.  Nil and
+\"\" are empty names."
+  (if (null names)
+      ""
+    (concat
+     (mapconcat (lambda (name)
+                  (if (and (stringp name) (not (string-empty-p name)))
+                      (string-replace "\0" ""
+                                      (substring-no-properties name))
+                    ""))
+                names
+                "\0")
+     "\0")))
+
+(defun exwm-workspace--urgency-values (flags)
+  "Return a list of 0 and 1, one per element of FLAGS."
+  (mapcar (lambda (flag) (if flag 1 0)) flags))
+
+(defvar exwm-workspace--urgency-atom nil
+  "Atom for the _EXWM_DESKTOP_URGENCY root property.")
+
+(defun exwm-workspace--publish-desktops ()
+  "Publish workspace names and urgency on the root window.
+_NET_DESKTOP_NAMES is null-terminated UTF-8 in global order.
+_EXWM_DESKTOP_URGENCY is one CARDINAL per workspace, 1 when that
+workspace is urgent."
+  (when exwm--connection
+    (let ((names nil)
+          (flags nil))
+      (dolist (frame exwm-workspace--list)
+        (push (frame-parameter frame 'exwm-workspace-name) names)
+        (push (and (frame-parameter frame 'exwm-urgency) t) flags))
+      (setq names (nreverse names)
+            flags (nreverse flags))
+      (xcb:+request exwm--connection
+          (make-instance 'xcb:ewmh:set-_NET_DESKTOP_NAMES
+                         :window exwm--root
+                         :data (exwm-workspace--format-desktop-names names)))
+      (unless exwm-workspace--urgency-atom
+        (setq exwm-workspace--urgency-atom
+              (exwm--intern-atom "_EXWM_DESKTOP_URGENCY")))
+      (let* ((values (exwm-workspace--urgency-values flags))
+             (pack (if xcb:lsb #'xcb:-pack-u4-lsb #'xcb:-pack-u4))
+             (bytes (apply #'vconcat (mapcar pack values))))
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:ChangeProperty
+                           :mode xcb:PropMode:Replace
+                           :window exwm--root
+                           :property exwm-workspace--urgency-atom
+                           :type xcb:Atom:CARDINAL
+                           :format 32
+                           :data-len (length values)
+                           :data bytes)))
+      (xcb:flush exwm--connection)
+      (force-mode-line-update t))))
+
+(defun exwm-workspace-rename (name &optional frame-or-index)
+  "Name workspace FRAME-OR-INDEX NAME.
+NAME empty clears the name.  Names are published as
+_NET_DESKTOP_NAMES in global workspace order."
+  (interactive
+   (list (read-string "Workspace name: ")
+         exwm-workspace--current))
+  (let ((frame (if frame-or-index
+                   (exwm-workspace--workspace-from-frame-or-index
+                    frame-or-index)
+                 exwm-workspace--current)))
+    (unless (and frame (frame-live-p frame))
+      (user-error "[EXWM] No such workspace"))
+    (when (stringp name)
+      (setq name (string-replace "\0" "" name)))
+    (set-frame-parameter frame 'exwm-workspace-name
+                         (and (stringp name)
+                              (not (string-empty-p name))
+                              name))
+    (exwm-workspace--publish-desktops)))
+
+(defun exwm-workspace-mark-urgent (&optional frame-or-index)
+  "Mark workspace FRAME-OR-INDEX urgent.
+Switching to that workspace clears the mark.  Client WM_HINTS
+urgency sets the same frame parameter."
+  (interactive)
+  (let ((frame (if frame-or-index
+                   (exwm-workspace--workspace-from-frame-or-index
+                    frame-or-index)
+                 exwm-workspace--current)))
+    (unless (and frame (frame-live-p frame))
+      (user-error "[EXWM] No such workspace"))
+    (set-frame-parameter frame 'exwm-urgency t)
+    (exwm-workspace--publish-desktops)))
+
+(defvar exwm-workspace-mode-line-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mode-line mouse-1] #'exwm-workspace-mode-line-menu)
+    (define-key map [mode-line mouse-3] #'exwm-workspace-mode-line-menu)
+    map)
+  "Keymap for `exwm-workspace-mode-line'.")
+
+(defun exwm-workspace--mode-line-text ()
+  "Mode-line text for the current workspace."
+  (if (not (and exwm--connection exwm-workspace--list))
+      ""
+    (let* ((index (or exwm-workspace-current-index 0))
+           (frame (nth index exwm-workspace--list))
+           (urgent (and frame (frame-parameter frame 'exwm-urgency)))
+           (text (exwm-workspace--format-label
+                  index
+                  (and frame (frame-parameter frame 'exwm-workspace-name))
+                  urgent)))
+      (propertize (concat " [" text "] ")
+                  'face (and urgent 'warning)
+                  'mouse-face 'mode-line-highlight
+                  'help-echo "Mouse-1: workspace menu"
+                  'local-map exwm-workspace-mode-line-map))))
+
+(defun exwm-workspace--mode-line-menu-map ()
+  "Menu keymap for the workspace indicator."
+  (let ((menu (make-sparse-keymap "Workspace"))
+        (switch (make-sparse-keymap "Switch")))
+    (cl-loop for frame in exwm-workspace--list
+             for index from 0
+             do (let ((index index)
+                      (label (exwm-workspace--format-label
+                              index
+                              (frame-parameter frame 'exwm-workspace-name)
+                              (frame-parameter frame 'exwm-urgency))))
+                  (define-key switch (vector index)
+                    `(menu-item ,label
+                                ,(lambda ()
+                                   (interactive)
+                                   (exwm-workspace-switch index))))))
+    (define-key menu [switch] `(menu-item "Switch" ,switch))
+    (define-key menu [add] '(menu-item "Add" exwm-workspace-add))
+    (define-key menu [delete] '(menu-item "Delete" exwm-workspace-delete))
+    (define-key menu [move] '(menu-item "Move" exwm-workspace-move))
+    (define-key menu [swap] '(menu-item "Swap" exwm-workspace-swap))
+    (define-key menu [rename] '(menu-item "Rename" exwm-workspace-rename))
+    (define-key menu [urgent] '(menu-item "Mark urgent" exwm-workspace-mark-urgent))
+    menu))
+
+(defun exwm-workspace--menu-command (binding)
+  "Return the command in menu BINDING, or nil."
+  (cond
+   ((commandp binding) binding)
+   ((and (eq (car-safe binding) 'menu-item)
+         (commandp (nth 2 binding)))
+    (nth 2 binding))))
+
+(defun exwm-workspace-mode-line-menu (event)
+  "Pop up the workspace menu at EVENT."
+  (interactive "e")
+  (let* ((menu (exwm-workspace--mode-line-menu-map))
+         (choice (x-popup-menu event menu)))
+    (when choice
+      (let ((binding (exwm-workspace--menu-command
+                      (lookup-key menu (vconcat choice)))))
+        (when (commandp binding)
+          (call-interactively binding))))))
+
+(defun exwm-workspace--set-mode-line (symbol value)
+  "Set SYMBOL to VALUE and install or remove the mode-line indicator."
+  (set-default symbol value)
+  (unless (listp global-mode-string)
+    (setq global-mode-string (list global-mode-string)))
+  (setq global-mode-string (delq 'exwm-workspace-mode-line global-mode-string))
+  (when value
+    (setq global-mode-string
+          (append global-mode-string '(exwm-workspace-mode-line))))
+  (force-mode-line-update t))
 
 (defun exwm-workspace--set-desktop (id)
   "Set _NET_WM_DESKTOP for X window ID."
@@ -1975,7 +2176,8 @@ Called from a timer."
     ;; Set _NET_DESKTOP_GEOMETRY.
     (exwm-workspace--set-desktop-geometry)
     ;; Update workareas.
-    (exwm-workspace--update-workareas))
+    (exwm-workspace--update-workareas)
+    (exwm-workspace--publish-desktops))
   (xcb:flush exwm--connection))
 
 (defun exwm-workspace--modify-all-x-frames-parameters (new-x-parameters)
@@ -2160,6 +2362,8 @@ applied to all subsequently created X frames."
               #'exwm-workspace--on-echo-area-clear))
   ;; Switch to the first workspace
   (exwm-workspace-switch 0 t)
+  (when exwm-workspace-show-mode-line
+    (exwm-workspace--set-mode-line 'exwm-workspace-show-mode-line t))
   ;; Prevent frame parameters introduced by this module from being
   ;; saved/restored.
   (dolist (i '(exwm-active exwm-outer-id exwm-id exwm-container exwm-geometry
