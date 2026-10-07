@@ -376,6 +376,24 @@ selected by `other-buffer'."
            ;; Do not select if already shown in some window.
            (not (get-buffer-window buffer t)))))
 
+(defun exwm-layout--raise-fullscreen (frame)
+  "Raise fullscreen X clients on workspace FRAME above other clients.
+Mapping the other clients on that workspace stacks them above a
+client that was already fullscreen.  Child frames are raised again
+by the caller so a popup stays visible."
+  (dolist (pair exwm--id-buffer-alist)
+    (with-current-buffer (cdr pair)
+      (when (and (eq exwm--frame frame)
+                 (exwm-layout--fullscreen-p)
+                 (not (exwm-layout--iconic-state-p)))
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:ConfigureWindow
+                           :window exwm--id
+                           :value-mask (logior xcb:ConfigWindow:BorderWidth
+                                               xcb:ConfigWindow:StackMode)
+                           :border-width 0
+                           :stack-mode xcb:StackMode:Above))))))
+
 (defun exwm-layout--set-client-list-stacking ()
   "Set _NET_CLIENT_LIST_STACKING."
   (exwm--log)
@@ -506,6 +524,8 @@ If FRAME is nil, refresh layout of selected frame."
                 (switch-to-prev-buffer window)
               (switch-to-next-buffer window))))))
     (exwm-layout--set-client-list-stacking)
+    (exwm-layout--raise-fullscreen frame)
+    (exwm-workspace--raise-child-frames)
     (xcb:flush exwm--connection)))
 
 (defun exwm-layout--on-minibuffer-setup ()
