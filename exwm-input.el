@@ -796,6 +796,9 @@ Current buffer must be an `exwm-mode' buffer."
             exwm-input--global-prefix-keys)
       (memq event exwm-input-prefix-keys)
       (exwm-input--modifier-event-p event)
+      ;; `C-g' is not a prefix key.  Putting it in
+      ;; `exwm-input-prefix-keys' would also change simulation keys.
+      (eq event ?\C-g)
       (when overriding-terminal-local-map
         (lookup-key overriding-terminal-local-map
                     (vector event)))
