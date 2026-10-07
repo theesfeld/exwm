@@ -1,0 +1,40 @@
+#!/bin/sh
+# Keep the X session up when Emacs dies from a fatal signal.
+#
+# This process is the xinit client.  Emacs is the window manager.
+# A normal Emacs exit ends the session, and so do SIGINT and SIGTERM.
+# Any other signal starts Emacs again.  Five crashes shorter than
+# EXWM_SESSION_STABLE seconds (default 30) end the session instead of
+# looping.  A run that long clears that count.
+#
+# Clients that are still children of the root are managed when Emacs
+# starts again.  A client reparented into a window Emacs created is
+# destroyed with that window: the server frees a dead client's
+# resources, and no Lisp runs during the crash.
+
+stable=${EXWM_SESSION_STABLE:-30}
+tries=0
+
+while true; do
+    start=$(date +%s)
+    emacs "$@"
+    status=$?
+    now=$(date +%s)
+    if [ $((now - start)) -ge "$stable" ]; then
+        tries=0
+    fi
+    if [ "$status" -le 128 ]; then
+        exit "$status"
+    fi
+    sig=$((status - 128))
+    if [ "$sig" -eq 2 ] || [ "$sig" -eq 15 ]; then
+        exit "$status"
+    fi
+    tries=$((tries + 1))
+    if [ "$tries" -ge 5 ]; then
+        echo "exwm-session: Emacs died from signal $sig five times; giving up." >&2
+        exit "$status"
+    fi
+    echo "exwm-session: Emacs died from signal $sig; starting it again." >&2
+    sleep 1
+done
