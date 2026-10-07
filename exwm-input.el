@@ -274,6 +274,8 @@ This value should always be overwritten.")
 Current buffer will be the `exwm-mode' buffer when this hook runs.")
 
 (defvar exwm-workspace--current)
+(defvar exwm-floating-border-color-focused)
+(declare-function exwm-floating-refresh-borders "exwm-floating.el" ())
 (declare-function exwm-floating--do-moveresize "exwm-floating.el"
                   (data _synthetic))
 (declare-function exwm-floating--start-moveresize "exwm-floating.el"
@@ -506,7 +508,9 @@ attempt later."
               (exwm-input--set-active-window
                (or (frame-parameter exwm-workspace--current 'exwm-outer-id)
                    xcb:Window:None)))
-            (xcb:flush exwm--connection)))))))
+            (xcb:flush exwm--connection)))))
+    (when exwm-floating-border-color-focused
+      (exwm-floating-refresh-borders))))
 
 (defun exwm-input--set-active-window (id)
   "Set _NET_ACTIVE_WINDOW to ID."

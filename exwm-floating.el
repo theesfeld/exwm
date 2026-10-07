@@ -49,21 +49,47 @@ This hook runs in the context of the corresponding buffer."
   :initialize #'custom-initialize-default
   :set (lambda (symbol value)
          (set-default symbol value)
-         ;; Change border color for all floating X windows.
          (when exwm--connection
-           (let ((border-pixel (exwm--color->pixel value)))
-             (when border-pixel
-               (dolist (pair exwm--id-buffer-alist)
-                 (with-current-buffer (cdr pair)
-                   (when exwm--floating-frame
-                     (xcb:+request exwm--connection
-                         (make-instance 'xcb:ChangeWindowAttributes
-                                        :window
-                                        (frame-parameter exwm--floating-frame
-                                                         'exwm-container)
-                                        :value-mask xcb:CW:BorderPixel
-                                        :border-pixel border-pixel)))))
-               (xcb:flush exwm--connection))))))
+           (exwm-floating-refresh-borders))))
+
+(defcustom exwm-floating-border-color-focused nil
+  "Border color of the focused floating window.
+When nil, every floating window uses `exwm-floating-border-color'."
+  :type '(choice (const :tag "Same as other windows" nil)
+                 (color :tag "Focused window"))
+  :initialize #'custom-initialize-default
+  :set (lambda (symbol value)
+         (set-default symbol value)
+         (when exwm--connection
+           (exwm-floating-refresh-borders))))
+
+(defun exwm-floating-refresh-borders ()
+  "Paint floating-window borders for the current focus.
+With `exwm-floating-border-color-focused' nil, every window uses
+`exwm-floating-border-color'."
+  (when exwm--connection
+    (let* ((focus-color exwm-floating-border-color-focused)
+           (normal (exwm--color->pixel exwm-floating-border-color))
+           (focus (exwm--color->pixel
+                   (or focus-color exwm-floating-border-color))))
+      (dolist (pair exwm--id-buffer-alist)
+        (with-current-buffer (cdr pair)
+          (when exwm--floating-frame
+            (let* ((window (get-buffer-window nil t))
+                   (pixel (if (and focus-color
+                                   window
+                                   (eq window (selected-window)))
+                              focus
+                            normal))
+                   (container (frame-parameter exwm--floating-frame
+                                               'exwm-container)))
+              (when (and pixel container)
+                (xcb:+request exwm--connection
+                    (make-instance 'xcb:ChangeWindowAttributes
+                                   :window container
+                                   :value-mask xcb:CW:BorderPixel
+                                   :border-pixel pixel)))))))
+      (xcb:flush exwm--connection))))
 
 (defcustom exwm-floating-border-width 1
   "Border width of floating windows."
