@@ -145,6 +145,41 @@ Set during `exwm--init'.")
       (exwm-layout--refresh)
       (call-interactively #'exwm-input-grab-keyboard))))
 
+(defun exwm--run-or-raise-match-p (class)
+  "Return non-nil when this EXWM buffer matches CLASS."
+  (and (derived-mode-p 'exwm-mode)
+       (or (and (stringp exwm-class-name)
+                (string-equal-ignore-case exwm-class-name class))
+           (and (stringp exwm-instance-name)
+                (string-equal-ignore-case exwm-instance-name class)))))
+
+(defun exwm-run-or-raise (program &optional class)
+  "Display an existing window of CLASS, or start PROGRAM.
+CLASS defaults to the first word of PROGRAM.  Matching compares
+`exwm-class-name' and `exwm-instance-name', ignoring case.  A visible
+match is preferred; otherwise the newest match is used.  If the
+current buffer matches, it is buried."
+  (interactive (list (read-shell-command "Run or raise: ")))
+  (setq class (or class (car (split-string program "[ \t\n]+" t))))
+  (unless (and (stringp class) (not (string-empty-p class)))
+    (user-error "[EXWM] No program to run"))
+  (let (matches)
+    (dolist (pair exwm--id-buffer-alist)
+      (with-current-buffer (cdr pair)
+        (when (exwm--run-or-raise-match-p class)
+          (push (current-buffer) matches))))
+    (setq matches (nreverse matches))
+    (cond
+     ((memq (current-buffer) matches)
+      (bury-buffer))
+     (matches
+      (exwm-workspace-switch-to-buffer
+       (or (cl-find-if (lambda (buffer) (get-buffer-window buffer t))
+                       matches)
+           (car (last matches)))))
+     (t
+      (start-process-shell-command "exwm-run-or-raise" nil program)))))
+
 (defun exwm--update-desktop (xwin)
   "Update _NET_WM_DESKTOP.
 Argument XWIN contains the X window of the `exwm-mode' buffer."
