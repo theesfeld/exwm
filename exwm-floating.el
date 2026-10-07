@@ -189,8 +189,17 @@ configured dimension is invalid."
               (buffer-name) dimension val)
         nil))))
 
-(defun exwm-floating--set-floating (id)
-  "Make window ID floating."
+(defvar exwm-floating--user nil
+  "Non-nil while the user, rather than a client, asks to float.")
+
+(cl-defun exwm-floating--set-floating (id)
+  "Make window ID floating.
+A buffer with `exwm--stay-tiled' set stays tiled unless
+`exwm-floating--user' is non-nil."
+  (when (with-current-buffer (exwm--id->buffer id)
+          (and exwm--stay-tiled (not exwm-floating--user)))
+    (exwm--log "#x%x stays tiled" id)
+    (cl-return-from exwm-floating--set-floating))
   ;; Hide the non-floating X window first.
   (replace-buffer-in-windows (exwm--id->buffer id))
   (with-current-buffer (exwm--id->buffer id)
@@ -447,16 +456,36 @@ configured dimension is invalid."
     (run-hooks 'exwm-floating-exit-hook)))
 
 ;;;###autoload
-(cl-defun exwm-floating-toggle-floating ()
+(defun exwm-floating-set-floating ()
+  "Float the current X window.
+This is the user request, so it floats a window that is configured
+to stay tiled."
+  (interactive)
+  (unless (and (derived-mode-p 'exwm-mode) exwm--id)
+    (user-error "[EXWM] No managed X window to float"))
+  (unless exwm--floating-frame
+    (let ((exwm-floating--user t))
+      (exwm-floating--set-floating exwm--id))))
+
+;;;###autoload
+(defun exwm-floating-unset-floating ()
+  "Tile the current X window."
+  (interactive)
+  (unless (and (derived-mode-p 'exwm-mode) exwm--id)
+    (user-error "[EXWM] No managed X window to tile"))
+  (when exwm--floating-frame
+    (exwm-floating--unset-floating exwm--id)))
+
+;;;###autoload
+(defun exwm-floating-toggle-floating ()
   "Toggle the current window between floating and non-floating states."
   (interactive)
   (exwm--log)
   (unless (derived-mode-p 'exwm-mode)
-    (cl-return-from exwm-floating-toggle-floating))
-  (with-current-buffer (window-buffer)
-    (if exwm--floating-frame
-        (exwm-floating--unset-floating exwm--id)
-      (exwm-floating--set-floating exwm--id))))
+    (user-error "[EXWM] No managed X window"))
+  (if exwm--floating-frame
+      (exwm-floating-unset-floating)
+    (exwm-floating-set-floating)))
 
 ;;;###autoload
 (defun exwm-floating-hide ()
