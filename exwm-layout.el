@@ -40,6 +40,19 @@
 That is, when t, Emacs won't intercept keys sent to fullscreen applications."
   :type 'boolean)
 
+(defcustom exwm-layout-minibuffer-unfullscreen nil
+  "When non-nil, leave fullscreen while the minibuffer is active.
+A fullscreen X client covers the minibuffer.  The client is restored
+for the duration of the minibuffer, then made fullscreen again unless
+the user has left fullscreen."
+  :type 'boolean)
+
+(defvar exwm-layout--minibuffer-fullscreen nil
+  "X window ids taken out of fullscreen for the minibuffer.")
+
+(defvar-local exwm--fullscreen-for-minibuffer nil
+  "Non-nil while fullscreen is suspended so the minibuffer can be seen.")
+
 (defcustom exwm-layout-show-all-buffers nil
   "Non-nil to allow switching to buffers on other workspaces."
   :type 'boolean)
@@ -276,6 +289,10 @@ that choice is in effect."
       (cl-return-from exwm-layout-set-fullscreen))
     (when (and exwm--fullscreen-hold (not user))
       (cl-return-from exwm-layout-set-fullscreen))
+    (when user
+      (setq exwm--fullscreen-for-minibuffer nil))
+    (when (and exwm--fullscreen-for-minibuffer (not user))
+      (cl-return-from exwm-layout-set-fullscreen))
     (setq exwm--fullscreen-hold nil)
     ;; Expand the X window to fill the whole screen.
     (with-slots (x y width height) (exwm-workspace--get-geometry exwm--frame)
@@ -315,7 +332,8 @@ ignored until the user enters fullscreen again."
     (unless (exwm-layout--fullscreen-p)
       (cl-return-from exwm-layout-unset-fullscreen))
     (when user
-      (setq exwm--fullscreen-hold t))
+      (setq exwm--fullscreen-hold t
+            exwm--fullscreen-for-minibuffer nil))
     ;; `exwm-layout--show' relies on `exwm--ewmh-state' to decide whether to
     ;; fullscreen the window.
     (setq exwm--ewmh-state
@@ -770,12 +788,38 @@ only. Otherwise, it's toggled globally."
               old-bottom-offset))))
       (force-mode-line-update))))
 
+(defun exwm-layout--minibuffer-leave-fullscreen ()
+  "Leave fullscreen while the minibuffer is in use.
+See `exwm-layout-minibuffer-unfullscreen'."
+  (setq exwm-layout--minibuffer-fullscreen nil)
+  (when exwm-layout-minibuffer-unfullscreen
+    (dolist (pair exwm--id-buffer-alist)
+      (with-current-buffer (cdr pair)
+        (when (and (eq exwm--frame exwm-workspace--current)
+                   (exwm-layout--fullscreen-p))
+          (setq exwm--fullscreen-for-minibuffer t)
+          (push exwm--id exwm-layout--minibuffer-fullscreen)
+          (exwm-layout-unset-fullscreen exwm--id))))))
+
+(defun exwm-layout--minibuffer-restore-fullscreen ()
+  "Restore fullscreen left for the minibuffer."
+  (dolist (id exwm-layout--minibuffer-fullscreen)
+    (let ((buffer (exwm--id->buffer id)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq exwm--fullscreen-for-minibuffer nil)
+          (unless exwm--fullscreen-hold
+            (exwm-layout-set-fullscreen id))))))
+  (setq exwm-layout--minibuffer-fullscreen nil))
+
 (defun exwm-layout--init ()
   "Initialize layout module."
   ;; Auto refresh layout
   (exwm--log)
   (add-hook 'window-configuration-change-hook #'exwm-layout--refresh)
   (add-hook 'window-size-change-functions #'exwm-layout--refresh)
+  (add-hook 'minibuffer-setup-hook #'exwm-layout--minibuffer-leave-fullscreen)
+  (add-hook 'minibuffer-exit-hook #'exwm-layout--minibuffer-restore-fullscreen)
   (unless (exwm-workspace--minibuffer-own-frame-p)
     ;; Refresh when minibuffer grows
     (add-hook 'minibuffer-setup-hook #'exwm-layout--on-minibuffer-setup t)
@@ -788,6 +832,9 @@ only. Otherwise, it's toggled globally."
   (exwm--log)
   (remove-hook 'window-configuration-change-hook #'exwm-layout--refresh)
   (remove-hook 'window-size-change-functions #'exwm-layout--refresh)
+  (remove-hook 'minibuffer-setup-hook #'exwm-layout--minibuffer-leave-fullscreen)
+  (remove-hook 'minibuffer-exit-hook #'exwm-layout--minibuffer-restore-fullscreen)
+  (setq exwm-layout--minibuffer-fullscreen nil)
   (remove-hook 'minibuffer-setup-hook #'exwm-layout--on-minibuffer-setup)
   (when exwm-layout--timer
     (cancel-timer exwm-layout--timer)
