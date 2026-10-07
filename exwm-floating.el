@@ -244,6 +244,12 @@ configured dimension is invalid."
 (defvar exwm-floating--user nil
   "Non-nil while the user, rather than a client, asks to float.")
 
+(defvar-local exwm--saved-tab-line-format nil
+  "Value of `tab-line-format' saved while this buffer floats.")
+
+(defvar-local exwm--tab-line-hidden-for-float nil
+  "Non-nil when floating cleared `tab-line-format' for this buffer.")
+
 (cl-defun exwm-floating--set-floating (id)
   "Make window ID floating.
 A buffer with `exwm--stay-tiled' set stays tiled unless
@@ -318,6 +324,15 @@ A buffer with `exwm--stay-tiled' set stays tiled unless
              (or (plist-get exwm--configurations setting) 'none)))
            ((not exwm--mwm-hints-decorations)
             (set-window-parameter window prop 'none))))
+
+        ;; A tab line is not part of the floating inset.  Leaving it
+        ;; up covers the client and shifts the border.  The tiling
+        ;; window is a different window, so restore the variable when
+        ;; this buffer leaves the floating frame.
+        (unless exwm--tab-line-hidden-for-float
+          (setq exwm--saved-tab-line-format tab-line-format
+                exwm--tab-line-hidden-for-float t)
+          (setq-local tab-line-format nil))
 
         ;; We MUST redisplay with the frame visible here in order to correctly calculate the sizes.
         (redisplay)
@@ -459,6 +474,10 @@ A buffer with `exwm--stay-tiled' set stays tiled unless
   (let ((buffer (exwm--id->buffer id)))
     (with-current-buffer buffer
       (when exwm--floating-frame
+        (when exwm--tab-line-hidden-for-float
+          (setq-local tab-line-format exwm--saved-tab-line-format)
+          (setq exwm--tab-line-hidden-for-float nil
+                exwm--saved-tab-line-format nil))
         ;; The X window is already mapped.
         ;; Unmap the X window.
         (xcb:+request exwm--connection
@@ -1051,6 +1070,12 @@ Float resizing is stopped when TYPE is nil."
                              ((> y 2) xcb:ewmh:_NET_WM_MOVERESIZE_SIZE_BOTTOM)
                              ((< x 1) xcb:ewmh:_NET_WM_MOVERESIZE_SIZE_LEFT)
                              ((< y 1) xcb:ewmh:_NET_WM_MOVERESIZE_SIZE_TOP)))))
+        (when (and type
+                   (not (eq type xcb:ewmh:_NET_WM_MOVERESIZE_MOVE))
+                   (bufferp buffer-or-id)
+                   (buffer-local-value 'exwm--fixed-size buffer-or-id))
+          (exwm-floating--stop-moveresize)
+          (user-error "[EXWM] Window size is fixed"))
         (if (not type)
             (exwm-floating--stop-moveresize)
           (cond ((= type xcb:ewmh:_NET_WM_MOVERESIZE_MOVE)
@@ -1315,6 +1340,8 @@ Both DELTA-X and DELTA-Y default to 1.  This command should be bound locally."
   "Grow the floating window by DELTA-WIDTH and DELTA-HEIGHT pixels."
   (cond
    ((and (derived-mode-p 'exwm-mode) exwm--floating-frame)
+    (when exwm--fixed-size
+      (user-error "[EXWM] Window size is fixed"))
     (unless (and (= 0 delta-width) (= 0 delta-height))
       (set-frame-size exwm--floating-frame
                       (max 1 (+ (frame-pixel-width exwm--floating-frame)
