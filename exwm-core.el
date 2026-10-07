@@ -409,6 +409,23 @@ One of `line-mode' or `char-mode'.")
                      (/= ,i exwm-workspace-current-index)])
                  (number-sequence 0 (1- (length exwm-workspace--list)))))))))
 
+(defconst exwm--edit-commands
+  '(self-insert-command org-self-insert-command yank newline newline-and-indent)
+  "Commands that would edit an EXWM buffer and signal `buffer-read-only'.")
+
+(defun exwm--explain-input-mode ()
+  "Explain line-mode or char-mode instead of signaling `buffer-read-only'."
+  (interactive)
+  (if (eq exwm--input-mode 'char-mode)
+      (message "[EXWM] Char-mode: Emacs received this key, so a global grab likely matches it. See `exwm-input-global-keys'.")
+    (message "[EXWM] Line-mode: unbound keys go to the application. `C-c C-k' enters char-mode; the mode line shows \"line\" or \"char\".")))
+(put 'exwm--explain-input-mode 'completion-predicate #'ignore)
+
+(defun exwm--replace-edit-command ()
+  "Run before a command that would edit this EXWM buffer."
+  (when (memq this-command exwm--edit-commands)
+    (setq this-command #'exwm--explain-input-mode)))
+
 (define-derived-mode exwm-mode nil "EXWM"
   "Major mode for managing X windows.
 
@@ -416,6 +433,8 @@ One of `line-mode' or `char-mode'.")
   :interactive nil :abbrev-table nil :syntax-table nil
   ;; Change major-mode is not allowed
   (add-hook 'change-major-mode-hook #'kill-buffer nil t)
+  ;; Typing here used to signal "Buffer is read-only".
+  (add-hook 'pre-command-hook #'exwm--replace-edit-command nil t)
   ;; Kill buffer -> close window
   (add-hook 'kill-buffer-query-functions
             #'exwm-manage--kill-buffer-query-function nil t)
