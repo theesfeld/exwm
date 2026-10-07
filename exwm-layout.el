@@ -22,10 +22,17 @@
 ;;; Commentary:
 
 ;; This module is responsible for keeping X client window properly displayed.
+;;
+;; Tiled gaps, borders, and rounded corners stay off until the user sets
+;; them.  Corners are an X Shape mask: pixels outside the quarter-circle
+;; are not part of the window, so the workspace frame or the root shows
+;; through.  The mask is not anti-aliased.  EXWM does not start a
+;; compositor.
 
 ;;; Code:
 
 (require 'exwm-core)
+(require 'xcb-shape)
 
 (defgroup exwm-layout nil
   "Layout."
@@ -56,6 +63,100 @@ the user has left fullscreen."
 (defcustom exwm-layout-show-all-buffers nil
   "Non-nil to allow switching to buffers on other workspaces."
   :type 'boolean)
+
+(defcustom exwm-layout-gap-outer 0
+  "Empty pixels inside each workspace edge, after struts.
+An integer applies to every side.  A list (LEFT TOP RIGHT BOTTOM)
+is per side.  0 leaves the workarea unchanged.
+
+The workspace frame is this much smaller than the monitor, so the
+root window shows around it.  A fullscreen client fills that frame
+and does not cover the outer gap.  A gap that does not fit is
+clamped so the workarea keeps at least one pixel."
+  :type '(choice (integer :tag "All sides")
+                 (list :tag "Left, top, right, bottom"
+                       (integer :tag "Left")
+                       (integer :tag "Top")
+                       (integer :tag "Right")
+                       (integer :tag "Bottom")))
+  :initialize #'custom-initialize-default
+  :set #'exwm-layout--set-gap)
+
+(defcustom exwm-layout-gap-inner 0
+  "Workspace-frame pixels left around each tiled X client.
+An integer applies to every side.  A list (LEFT TOP RIGHT BOTTOM)
+is per side.  0 keeps edge-to-edge tiling.
+
+Each client is inset by its own value, so the visible space
+between two neighbors is the sum of the two facing sides.
+Floating and fullscreen clients ignore this.  A gap that does not
+fit is clamped so the client keeps at least one pixel."
+  :type '(choice (integer :tag "All sides")
+                 (list :tag "Left, top, right, bottom"
+                       (integer :tag "Left")
+                       (integer :tag "Top")
+                       (integer :tag "Right")
+                       (integer :tag "Bottom")))
+  :initialize #'custom-initialize-default
+  :set #'exwm-layout--set-gap)
+
+(defcustom exwm-layout-border-width 0
+  "Border width in pixels around tiled X clients.
+0 draws no border.  The border is inside `exwm-layout-gap-inner'
+when that gap is wide enough, and otherwise it is taken from the
+client.  It is cleared while the client is fullscreen.  Floating
+windows keep `exwm-floating-border-width' and
+`exwm-floating-border-color'."
+  :type 'integer
+  :initialize #'custom-initialize-default
+  :set #'exwm-layout--set-nonneg)
+
+(defcustom exwm-layout-border-color nil
+  "Border color of unfocused tiled X clients.
+Nil uses the `exwm-layout-border' face, which inherits from
+`mode-line-inactive', so a theme colors the border.  A color name
+overrides the face.  This does not change
+`exwm-floating-border-color'."
+  :type '(choice (const :tag "Theme face" nil)
+                 (color :tag "Color"))
+  :initialize #'custom-initialize-default
+  :set #'exwm-layout--set-border-color)
+
+(defcustom exwm-layout-border-color-focused nil
+  "Border color of the focused tiled X client.
+Nil uses the `exwm-layout-border-focused' face, which inherits
+from `mode-line'.  A color name overrides the face."
+  :type '(choice (const :tag "Theme face" nil)
+                 (color :tag "Color"))
+  :initialize #'custom-initialize-default
+  :set #'exwm-layout--set-border-color)
+
+(defcustom exwm-layout-corner-radius 0
+  "Radius in pixels of rounded corners on tiled X clients.
+0 leaves the window rectangular.  A positive radius sets an X
+Shape bounding mask.  A pixel stays when its center lies inside
+the quarter-circle, so a radius of 1 often removes nothing.  The
+mask is binary, not a translucent anti-aliased corner.  EXWM does
+not start a compositor.  Without the Shape extension the window
+stays rectangular and EXWM warns once.  Fullscreen clears the
+mask.  Floating windows are left rectangular."
+  :type 'integer
+  :initialize #'custom-initialize-default
+  :set #'exwm-layout--set-nonneg)
+
+(defface exwm-layout-border
+  '((t :inherit mode-line-inactive))
+  "Border of an unfocused tiled X client.
+Used when `exwm-layout-border-color' is nil.  Themes can set this
+face; otherwise it follows `mode-line-inactive'."
+  :group 'exwm-layout)
+
+(defface exwm-layout-border-focused
+  '((t :inherit mode-line))
+  "Border of the focused tiled X client.
+Used when `exwm-layout-border-color-focused' is nil.  Themes can
+set this face; otherwise it follows `mode-line'."
+  :group 'exwm-layout)
 
 (defconst exwm-layout--floating-hidden-position -101
   "Where to place hidden floating X windows.")
@@ -98,6 +199,9 @@ inside a correctly sized container."
 (defvar exwm-layout--timer nil "Timer used to track echo area changes.")
 
 (defvar exwm-workspace--current)
+(defvar exwm-workspace--list)
+(declare-function exwm-workspace--set-fullscreen "exwm-workspace.el" (frame))
+(declare-function exwm-workspace--update-workareas "exwm-workspace.el" ())
 (declare-function exwm-input--release-keyboard "exwm-input.el")
 (declare-function exwm-input--grab-keyboard "exwm-input.el")
 (declare-function exwm-input-grab-keyboard "exwm-input.el")
@@ -157,6 +261,431 @@ See variable `exwm-layout-auto-iconify'."
                 (exwm-layout--refresh-floating exwm--floating-frame)
               (exwm-layout--hide exwm--id))))))))
 
+(defvar exwm-layout--shape-supported nil
+  "Non-nil when the server provides the Shape extension.")
+
+(defvar exwm-layout--shape-warned nil
+  "Non-nil after warning that the Shape extension is missing.")
+
+(defvar-local exwm-layout--shaped nil
+  "Non-nil when EXWM set this client's bounding shape.")
+
+(defvar-local exwm-layout--chrome-applied nil
+  "Non-nil when EXWM set a tiled border on this client.")
+
+(defun exwm-layout--gap-insets (value)
+  "Return (LEFT TOP RIGHT BOTTOM) for gap VALUE.
+A non-negative integer applies to every side.  A list of four
+non-negative integers is per side.  Any other value is 0."
+  (cond
+   ((natnump value)
+    (list value value value value))
+   ((and (proper-list-p value)
+         (= (length value) 4)
+         (cl-every #'natnump value))
+    (copy-sequence value))
+   (t '(0 0 0 0))))
+
+(defun exwm-layout--gap-valid-p (value)
+  "Non-nil when VALUE is a legal gap option."
+  (or (natnump value)
+      (and (proper-list-p value)
+           (= (length value) 4)
+           (cl-every #'natnump value))))
+
+(defun exwm-layout--fit-pair (a b limit)
+  "Shrink non-negative A and B so their sum is at most LIMIT.
+Reduce B first.  Return (A B)."
+  (let ((overflow (- (+ a b) limit)))
+    (when (> overflow 0)
+      (let ((take (min b overflow)))
+        (setq b (- b take)
+              overflow (- overflow take)))
+      (setq a (max 0 (- a overflow))))
+    (list a b)))
+
+(defun exwm-layout--inset-rectangle (x y width height insets)
+  "Shrink X Y WIDTH HEIGHT by INSETS.
+INSETS is (LEFT TOP RIGHT BOTTOM).  A positive input keeps at
+least one pixel.  Return (X Y WIDTH HEIGHT)."
+  (if (or (not (integerp width)) (not (integerp height))
+          (<= width 0) (<= height 0))
+      (list x y (max 1 (or width 0)) (max 1 (or height 0)))
+    (let* ((left (nth 0 insets))
+           (top (nth 1 insets))
+           (right (nth 2 insets))
+           (bottom (nth 3 insets))
+           (xs (exwm-layout--fit-pair left right (1- width)))
+           (ys (exwm-layout--fit-pair top bottom (1- height))))
+      (setq left (nth 0 xs)
+            right (nth 1 xs)
+            top (nth 0 ys)
+            bottom (nth 1 ys))
+      (list (+ x left)
+            (+ y top)
+            (- width left right)
+            (- height top bottom)))))
+
+(defun exwm-layout--apply-outer-gap (rectangle)
+  "Shrink RECTANGLE in place by `exwm-layout-gap-outer'."
+  (with-slots (x y width height) rectangle
+    (pcase-let ((`(,nx ,ny ,nw ,nh)
+                 (exwm-layout--inset-rectangle
+                  x y width height
+                  (exwm-layout--gap-insets exwm-layout-gap-outer))))
+      (setq x nx y ny width nw height nh)))
+  rectangle)
+
+(defun exwm-layout--tiled-chrome (x y width height)
+  "Return (X Y WIDTH HEIGHT BORDER) for a tiled client in a slot.
+The slot is X Y WIDTH HEIGHT.  The inner gap insets the visual
+bounds.  The border lies inside those bounds.  X and Y are the
+outer corner, including the border.  WIDTH and HEIGHT are the
+interior and do not include the border."
+  (let* ((boxed (exwm-layout--inset-rectangle
+                 x y width height
+                 (exwm-layout--gap-insets exwm-layout-gap-inner)))
+         (bx (nth 0 boxed))
+         (by (nth 1 boxed))
+         (bw (nth 2 boxed))
+         (bh (nth 3 boxed))
+         (border (if (natnump exwm-layout-border-width)
+                     exwm-layout-border-width
+                   0)))
+    (setq border (min border
+                      (max 0 (/ (1- bw) 2))
+                      (max 0 (/ (1- bh) 2))))
+    (list bx by
+          (- bw (* 2 border))
+          (- bh (* 2 border))
+          border)))
+
+(defun exwm-layout--chrome-wanted-p ()
+  "Non-nil when a tiled client should be inset, bordered, or rounded."
+  (or (and (natnump exwm-layout-border-width)
+           (> exwm-layout-border-width 0))
+      (and (natnump exwm-layout-corner-radius)
+           (> exwm-layout-corner-radius 0))
+      (not (equal (exwm-layout--gap-insets exwm-layout-gap-inner)
+                  '(0 0 0 0)))))
+
+(defun exwm-layout--corner-inset (radius y)
+  "Pixels outside the quarter-circle on row Y.
+RADIUS is the circle radius.  Y is 0 at the outer row.  A pixel
+is inside when its center lies on the circle whose center is the
+inner corner of the radius box."
+  (let* ((dy (- (+ y 0.5) radius))
+         (remain (- (* radius radius) (* dy dy))))
+    (if (<= remain 0.0)
+        radius
+      (let ((dx (sqrt remain)))
+        (max 0 (min radius (1+ (floor (- radius dx 0.5)))))))))
+
+(defun exwm-layout--merge-bands (rows)
+  "Merge vertically adjacent ROWS that share X and width.
+Each row is (X Y WIDTH HEIGHT)."
+  (let ((merged nil)
+        (current nil))
+    (dolist (row rows)
+      (if (and current
+               (= (nth 0 current) (nth 0 row))
+               (= (nth 2 current) (nth 2 row))
+               (= (+ (nth 1 current) (nth 3 current)) (nth 1 row)))
+          (setcar (nthcdr 3 current) (1+ (nth 3 current)))
+        (when current
+          (push current merged))
+        (setq current (copy-sequence row))))
+    (when current
+      (push current merged))
+    (nreverse merged)))
+
+(defun exwm-layout--rounded-rectangles (width height radius)
+  "Y-banded rectangles for a rounded WIDTH by HEIGHT mask.
+Return a list of (X Y WIDTH HEIGHT), or nil when that mask would
+be the full rectangle.  RADIUS is clamped to half of each side."
+  (when (and (integerp width) (integerp height) (integerp radius)
+             (> width 0) (> height 0) (> radius 0))
+    (let ((r (min radius (/ width 2) (/ height 2)))
+          (rows nil)
+          (y 0)
+          (rounded nil))
+      (when (> r 0)
+        (while (< y height)
+          (let* ((from-edge (cond ((< y r) y)
+                                  ((>= y (- height r)) (1- (- height y)))
+                                  (t r)))
+                 (inset (if (< from-edge r)
+                            (exwm-layout--corner-inset r from-edge)
+                          0))
+                 (w (- width (* 2 inset))))
+            (when (> inset 0)
+              (setq rounded t))
+            (when (> w 0)
+              (push (list inset y w 1) rows)))
+          (setq y (1+ y)))
+        (when rounded
+          (exwm-layout--merge-bands (nreverse rows)))))))
+
+(defun exwm-layout--usable-color (color)
+  "Return COLOR when it names a color, else nil."
+  (when (and (stringp color)
+             (not (string-prefix-p "unspecified" color))
+             (color-defined-p color))
+    color))
+
+(defun exwm-layout--resolve-border-color (explicit candidates)
+  "Return EXPLICIT, or the first usable color in CANDIDATES."
+  (or (exwm-layout--usable-color explicit)
+      (cl-some #'exwm-layout--usable-color candidates)))
+
+(defun exwm-layout--face-color (face)
+  "Background of FACE, including inherited faces."
+  (and (facep face) (face-background face nil t)))
+
+(defun exwm-layout--border-color (focused)
+  "Color name for a tiled border, or nil.
+FOCUSED selects the focused option and face.  An explicit color
+wins.  Otherwise the user's theme faces are used."
+  (if focused
+      (exwm-layout--resolve-border-color
+       exwm-layout-border-color-focused
+       (mapcar #'exwm-layout--face-color
+               '(exwm-layout-border-focused mode-line highlight)))
+    (exwm-layout--resolve-border-color
+     exwm-layout-border-color
+     (mapcar #'exwm-layout--face-color
+             '(exwm-layout-border mode-line-inactive shadow)))))
+
+(defun exwm-layout--client-focused-p ()
+  "Non-nil when the current buffer's window is selected."
+  (let ((window (get-buffer-window nil t)))
+    (and window (eq window (selected-window)))))
+
+(defun exwm-layout--set-client-geometry (id x y width height border)
+  "Configure ID to WIDTHxHEIGHT+X+Y with BORDER.
+X and Y include the border.  WIDTH and HEIGHT do not."
+  (xcb:+request exwm--connection
+      (make-instance 'xcb:ConfigureWindow
+                     :window id
+                     :value-mask (logior xcb:ConfigWindow:X
+                                         xcb:ConfigWindow:Y
+                                         xcb:ConfigWindow:Width
+                                         xcb:ConfigWindow:Height
+                                         xcb:ConfigWindow:BorderWidth)
+                     :x x
+                     :y y
+                     :width width
+                     :height height
+                     :border-width border)))
+
+(defun exwm-layout--paint-border (id border)
+  "Set the border pixel of ID when BORDER is positive."
+  (when (and exwm--connection (> border 0))
+    (let ((pixel (exwm--color->pixel
+                  (exwm-layout--border-color
+                   (exwm-layout--client-focused-p)))))
+      (when pixel
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:ChangeWindowAttributes
+                           :window id
+                           :value-mask xcb:CW:BorderPixel
+                           :border-pixel pixel))))))
+
+(defun exwm-layout--clear-tiled-border (id)
+  "Set ID's border width back to 0 when EXWM had changed it."
+  (when exwm-layout--chrome-applied
+    (xcb:+request exwm--connection
+        (make-instance 'xcb:ConfigureWindow
+                       :window id
+                       :value-mask xcb:ConfigWindow:BorderWidth
+                       :border-width 0))
+    (setq exwm-layout--chrome-applied nil)))
+
+(defun exwm-layout--shape-init ()
+  "Record whether the Shape extension is present."
+  (setq exwm-layout--shape-supported nil)
+  (condition-case err
+      (let ((data (xcb:get-extension-data exwm--connection 'xcb:shape)))
+        (setq exwm-layout--shape-supported
+              (and data (not (= 0 (slot-value data 'present))))))
+    (error
+     (exwm--log "shape init: %S" err)
+     (setq exwm-layout--shape-supported nil))))
+
+(defun exwm-layout--warn-shape-once ()
+  "Warn once that rounded corners need the Shape extension."
+  (unless (or exwm-layout--shape-supported exwm-layout--shape-warned)
+    (setq exwm-layout--shape-warned t)
+    (warn "[EXWM] Shape extension is unavailable; windows stay rectangular")))
+
+(defun exwm-layout--reset-shape (window)
+  "Make WINDOW rectangular."
+  (dolist (kind (list xcb:shape:SK:Bounding xcb:shape:SK:Clip))
+    (xcb:+request exwm--connection
+        (make-instance 'xcb:shape:Mask
+                       :operation xcb:shape:SO:Set
+                       :destination-kind kind
+                       :destination-window window
+                       :x-offset 0
+                       :y-offset 0
+                       :source-bitmap xcb:Pixmap:None))))
+
+(defun exwm-layout--shape-rectangles (window kind rectangles)
+  "Set shape KIND on WINDOW to RECTANGLES.
+RECTANGLES is a list of (X Y WIDTH HEIGHT)."
+  (xcb:+request exwm--connection
+      (make-instance 'xcb:shape:Rectangles
+                     :operation xcb:shape:SO:Set
+                     :destination-kind kind
+                     :ordering xcb:ClipOrdering:Unsorted
+                     :destination-window window
+                     :x-offset 0
+                     :y-offset 0
+                     :rectangles
+                     (mapcar (lambda (rect)
+                               (make-instance 'xcb:RECTANGLE
+                                              :x (nth 0 rect)
+                                              :y (nth 1 rect)
+                                              :width (nth 2 rect)
+                                              :height (nth 3 rect)))
+                             rectangles))))
+
+(defun exwm-layout--apply-shape (window width height radius border)
+  "Round WINDOW to RADIUS, or clear a mask EXWM applied.
+WIDTH and HEIGHT are the bounding size and include BORDER."
+  (let ((rects (and exwm-layout--shape-supported
+                    (> radius 0)
+                    (exwm-layout--rounded-rectangles width height radius))))
+    (cond
+     (rects
+      (exwm-layout--shape-rectangles window xcb:shape:SK:Bounding rects)
+      (let* ((inner-radius (max 0 (- radius border)))
+             (inner (and (> border 0)
+                         (> inner-radius 0)
+                         (exwm-layout--rounded-rectangles
+                          (- width (* 2 border))
+                          (- height (* 2 border))
+                          inner-radius))))
+        (if inner
+            (exwm-layout--shape-rectangles window xcb:shape:SK:Clip inner)
+          (when (and (> border 0) exwm-layout--shaped)
+            (xcb:+request exwm--connection
+                (make-instance 'xcb:shape:Mask
+                               :operation xcb:shape:SO:Set
+                               :destination-kind xcb:shape:SK:Clip
+                               :destination-window window
+                               :x-offset 0
+                               :y-offset 0
+                               :source-bitmap xcb:Pixmap:None)))))
+      (setq exwm-layout--shaped t))
+     ((and (not exwm-layout--shape-supported) (> radius 0))
+      (exwm-layout--warn-shape-once))
+     (exwm-layout--shaped
+      (exwm-layout--reset-shape window)
+      (setq exwm-layout--shaped nil)))))
+
+(defun exwm-layout--configure-client (id x y width height)
+  "Place client ID in slot X Y WIDTH HEIGHT.
+Tiled clients gain the inner gap, border, and corner radius.
+Floating and fullscreen clients do not.  Fullscreen drops a
+corner mask EXWM applied."
+  (cond
+   ((exwm-layout--fullscreen-p)
+    (exwm--set-geometry id x y width height)
+    (exwm-layout--clear-tiled-border id)
+    (when exwm-layout--shaped
+      (exwm-layout--reset-shape id)
+      (setq exwm-layout--shaped nil)))
+   (exwm--floating-frame
+    (exwm--set-geometry id x y width height)
+    (exwm-layout--clear-tiled-border id)
+    (when exwm-layout--shaped
+      (exwm-layout--reset-shape id)
+      (setq exwm-layout--shaped nil)))
+   ((not (exwm-layout--chrome-wanted-p))
+    (exwm--set-geometry id x y width height)
+    (exwm-layout--clear-tiled-border id)
+    (when exwm-layout--shaped
+      (exwm-layout--reset-shape id)
+      (setq exwm-layout--shaped nil)))
+   (t
+    (pcase-let ((`(,cx ,cy ,cw ,ch ,border)
+                 (exwm-layout--tiled-chrome x y width height)))
+      (exwm-layout--set-client-geometry id cx cy cw ch border)
+      (setq exwm-layout--chrome-applied (> border 0))
+      (when (> border 0)
+        (exwm-layout--paint-border id border))
+      (exwm-layout--apply-shape id
+                                (+ cw (* 2 border))
+                                (+ ch (* 2 border))
+                                (if (natnump exwm-layout-corner-radius)
+                                    exwm-layout-corner-radius
+                                  0)
+                                border)))))
+
+(defun exwm-layout-refresh-borders ()
+  "Paint tiled borders for the current focus.
+Colors come from the border options, or from the theme faces when
+those options are nil.  Floating borders are left alone."
+  (when (and exwm--connection
+             (natnump exwm-layout-border-width)
+             (> exwm-layout-border-width 0))
+    (let ((focus (exwm--color->pixel (exwm-layout--border-color t)))
+          (normal (exwm--color->pixel (exwm-layout--border-color nil))))
+      (dolist (pair exwm--id-buffer-alist)
+        (with-current-buffer (cdr pair)
+          (when (and exwm--id
+                     (not exwm--floating-frame)
+                     (not (exwm-layout--fullscreen-p))
+                     exwm-layout--chrome-applied)
+            (let ((pixel (if (exwm-layout--client-focused-p) focus normal)))
+              (when pixel
+                (xcb:+request exwm--connection
+                    (make-instance 'xcb:ChangeWindowAttributes
+                                   :window exwm--id
+                                   :value-mask xcb:CW:BorderPixel
+                                   :border-pixel pixel))))))))
+    (xcb:flush exwm--connection)))
+
+(defun exwm-layout--on-theme (&rest _)
+  "Repaint tiled borders after a theme change."
+  (when exwm--connection
+    (exwm-layout-refresh-borders)))
+
+(defun exwm-layout--refresh-chrome (&optional workareas)
+  "Retile after a gap, border, or corner change.
+Also recompute workareas when WORKAREAS is non-nil."
+  (when exwm--connection
+    (when workareas
+      (exwm-workspace--update-workareas)
+      (dolist (frame exwm-workspace--list)
+        (exwm-workspace--set-fullscreen frame)))
+    (dolist (frame exwm-workspace--list)
+      (exwm-layout--refresh frame))
+    (exwm-layout-refresh-borders)))
+
+(defun exwm-layout--set-gap (symbol value)
+  "Set gap SYMBOL to VALUE and refresh layout."
+  (unless (exwm-layout--gap-valid-p value)
+    (user-error "[EXWM] Gap must be a non-negative integer or (LEFT TOP RIGHT BOTTOM)"))
+  (set-default symbol value)
+  (exwm-layout--refresh-chrome (eq symbol 'exwm-layout-gap-outer)))
+
+(defun exwm-layout--set-nonneg (symbol value)
+  "Set SYMBOL to non-negative integer VALUE and refresh layout."
+  (unless (natnump value)
+    (user-error "[EXWM] %s must be a non-negative integer" symbol))
+  (set-default symbol value)
+  (exwm-layout--refresh-chrome nil))
+
+(defun exwm-layout--set-border-color (symbol value)
+  "Set border color SYMBOL to VALUE and repaint."
+  (unless (or (null value) (exwm-layout--usable-color value))
+    (user-error "[EXWM] Border color must be nil or a defined color name"))
+  (set-default symbol value)
+  (when exwm--connection
+    (exwm-layout-refresh-borders)))
+
 (defun exwm-layout--show (id &optional window)
   "Show window ID exactly fit in the Emacs window WINDOW."
   (exwm--log "Show #x%x in %s" id window)
@@ -213,7 +742,7 @@ See variable `exwm-layout-auto-iconify'."
                 width width*
                 height height*)))
       (unless (exwm-layout--placeholder-geometry-p x y width height)
-        (exwm--set-geometry id x y width height))
+        (exwm-layout--configure-client id x y width height))
       (xcb:+request exwm--connection (make-instance 'xcb:MapWindow :window id))
       (exwm-layout--set-state id xcb:icccm:WM_STATE:NormalState)
       (setq exwm--ewmh-state
@@ -305,6 +834,13 @@ that choice is in effect."
                                            xcb:ConfigWindow:StackMode)
                        :border-width 0
                        :stack-mode xcb:StackMode:Above))
+    (setq exwm-layout--chrome-applied nil)
+    (when (and exwm-layout--shape-supported
+               (or exwm-layout--shaped
+                   (and (natnump exwm-layout-corner-radius)
+                        (> exwm-layout-corner-radius 0))))
+      (exwm-layout--reset-shape exwm--id)
+      (setq exwm-layout--shaped nil))
     (cl-pushnew xcb:Atom:_NET_WM_STATE_FULLSCREEN exwm--ewmh-state)
     (exwm-layout--set-ewmh-state exwm--id)
     (xcb:flush exwm--connection)
@@ -825,7 +1361,10 @@ See `exwm-layout-minibuffer-unfullscreen'."
     (add-hook 'minibuffer-setup-hook #'exwm-layout--on-minibuffer-setup t)
     (setq exwm-layout--timer
           (run-with-idle-timer 0 t #'exwm-layout--on-echo-area-change t))
-    (add-hook 'echo-area-clear-hook #'exwm-layout--on-echo-area-change)))
+    (add-hook 'echo-area-clear-hook #'exwm-layout--on-echo-area-change))
+  (exwm-layout--shape-init)
+  (add-hook 'enable-theme-functions #'exwm-layout--on-theme)
+  (add-hook 'disable-theme-functions #'exwm-layout--on-theme))
 
 (defun exwm-layout--exit ()
   "Exit the layout module."
@@ -839,7 +1378,9 @@ See `exwm-layout-minibuffer-unfullscreen'."
   (when exwm-layout--timer
     (cancel-timer exwm-layout--timer)
     (setq exwm-layout--timer nil))
-  (remove-hook 'echo-area-clear-hook #'exwm-layout--on-echo-area-change))
+  (remove-hook 'echo-area-clear-hook #'exwm-layout--on-echo-area-change)
+  (remove-hook 'enable-theme-functions #'exwm-layout--on-theme)
+  (remove-hook 'disable-theme-functions #'exwm-layout--on-theme))
 
 (provide 'exwm-layout)
 ;;; exwm-layout.el ends here

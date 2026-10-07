@@ -180,6 +180,7 @@ Stops a client that immediately reparents the frame back from looping.")
 (declare-function exwm-input--on-buffer-list-update "exwm-input.el" ())
 (declare-function exwm-input--update-focus-defer "exwm-input.el" ())
 (defvar exwm-input--update-focus-window)
+(declare-function exwm-layout--apply-outer-gap "exwm-layout.el" (rectangle))
 (declare-function exwm-layout--fullscreen-p "exwm-layout.el" ())
 (declare-function exwm-layout--hide "exwm-layout.el" (id))
 (declare-function exwm-layout--other-buffer-predicate "exwm-layout.el"
@@ -446,6 +447,10 @@ Show PROMPT to the user if non-nil."
                               (< (max beg x)
                                  (min end (+ x width)))))
                  (decf height delta))))))))
+    ;; Outer gap is inside the strut-adjusted workarea.  Zero leaves
+    ;; each rectangle unchanged.
+    (dolist (w workareas)
+      (exwm-layout--apply-outer-gap w))
     ;; Save the result.
     (setq exwm-workspace--workareas workareas)
     (xcb:flush exwm--connection))
