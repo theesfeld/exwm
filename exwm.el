@@ -191,6 +191,160 @@ current buffer matches, it is buried."
      (t
       (start-process-shell-command "exwm-run-or-raise" nil program)))))
 
+(defconst exwm-launch--exec-codes
+  '(?f ?F ?u ?U ?d ?D ?n ?N ?i ?c ?k ?v ?m)
+  "Desktop Exec field codes, without the percent sign.")
+
+(defun exwm-launch--parse-exec (exec)
+  "Return the argument list of a desktop Exec line EXEC.
+Quoting follows the Desktop Entry Specification.  %% is a
+literal percent.  The other field codes are removed."
+  (when (stringp exec)
+    (let ((i 0)
+          (n (length exec))
+          (parts nil)
+          (chars nil)
+          (quoted nil))
+      (while (< i n)
+        (let ((ch (aref exec i)))
+          (cond
+           ((and (eq ch ?\\) (< (1+ i) n))
+            (setq i (1+ i)
+                  chars (cons (aref exec i) chars)
+                  i (1+ i)))
+           ((eq ch ?\")
+            (setq quoted (not quoted)
+                  i (1+ i)))
+           ((and (not quoted) (memq ch '(?\s ?\t ?\n ?\r)))
+            (when chars
+              (setq parts (cons (apply #'string (nreverse chars)) parts)
+                    chars nil))
+            (setq i (1+ i)))
+           ((eq ch ?%)
+            (setq i (1+ i))
+            (when (< i n)
+              (let ((code (aref exec i)))
+                (setq i (1+ i))
+                (cond
+                 ((eq code ?%)
+                  (setq chars (cons ?% chars)))
+                 ((memq code exwm-launch--exec-codes))
+                 (t
+                  (setq chars (cons code (cons ?% chars))))))))
+           (t
+            (setq chars (cons ch chars)
+                  i (1+ i))))))
+      (when chars
+        (setq parts (cons (apply #'string (nreverse chars)) parts)))
+      (nreverse (delq nil (mapcar (lambda (arg)
+                                    (if (string-empty-p arg) nil arg))
+                                  parts))))))
+
+(defun exwm-launch--read-desktop (text)
+  "Return the Desktop Entry fields of TEXT as an alist.
+The first value of a key wins.  Other groups are ignored."
+  (let ((section nil)
+        (fields nil))
+    (dolist (raw (split-string (or text "") "\n"))
+      (let ((line (string-trim raw)))
+        (cond
+         ((or (string-empty-p line) (eq (aref line 0) ?#)))
+         ((string-match "\\`\\[\\([^]]+\\)\\]\\'" line)
+          (setq section (match-string 1 line)))
+         ((and (equal section "Desktop Entry")
+               (string-match
+                "\\`\\([A-Za-z0-9-]+\\)[ \t]*=[ \t]*\\(.*\\)\\'" line))
+          (let ((key (match-string 1 line)))
+            (unless (assoc key fields)
+              (setq fields
+                    (cons (cons key (string-trim (match-string 2 line)))
+                          fields))))))))
+    (nreverse fields)))
+
+(defun exwm-launch--usable-p (fields)
+  "Return non-nil when FIELDS name a launchable application.
+Hidden entries, non-applications, and a missing Exec are skipped.
+TryExec is skipped when that program is not executable."
+  (and (string-equal-ignore-case
+        (or (cdr (assoc "Type" fields)) "") "Application")
+       (not (string-equal-ignore-case
+             (or (cdr (assoc "Hidden" fields)) "") "true"))
+       (let ((exec (cdr (assoc "Exec" fields))))
+         (and (stringp exec) (not (string-empty-p exec))))
+       (let ((try (cdr (assoc "TryExec" fields))))
+         (or (not (stringp try))
+             (string-empty-p try)
+             (if (file-name-absolute-p try)
+                 (file-executable-p try)
+               (executable-find try))))))
+
+(defun exwm-launch--data-dirs ()
+  "Return XDG data directories, home first.
+`XDG_DATA_HOME' defaults to ~/.local/share.  `XDG_DATA_DIRS'
+defaults to /usr/local/share:/usr/share."
+  (let ((home (or (getenv "XDG_DATA_HOME")
+                  (expand-file-name "~/.local/share")))
+        (dirs (or (getenv "XDG_DATA_DIRS")
+                  "/usr/local/share:/usr/share")))
+    (cons home (split-string dirs ":" t))))
+
+(defun exwm-launch--label (name file used)
+  "Return a completion label for NAME in FILE.
+USED is the list of labels already chosen."
+  (let ((base (format "%s (%s)"
+                      (if (and (stringp name) (not (string-empty-p name)))
+                          name
+                        (file-name-base file))
+                      (file-name-nondirectory file))))
+    (if (member base used)
+        (format "%s (%s)" name file)
+      base)))
+
+(defun exwm-launch--entries (&optional dirs)
+  "Return (LABEL . ARGV) for desktop applications under DIRS.
+DIRS defaults to `exwm-launch--data-dirs'.  Each directory is
+searched in `applications/'."
+  (let ((dirs (or dirs (exwm-launch--data-dirs)))
+        (entries nil)
+        (used nil))
+    (dolist (dir dirs)
+      (let ((root (expand-file-name "applications" dir)))
+        (when (file-directory-p root)
+          (dolist (file (directory-files-recursively root "\\.desktop\\'"))
+            (when (file-readable-p file)
+              (let ((fields (exwm-launch--read-desktop
+                             (with-temp-buffer
+                               (insert-file-contents file)
+                               (buffer-string)))))
+                (when (exwm-launch--usable-p fields)
+                  (let* ((argv (exwm-launch--parse-exec
+                                (cdr (assoc "Exec" fields))))
+                         (label (exwm-launch--label
+                                 (cdr (assoc "Name" fields))
+                                 file used)))
+                    (when argv
+                      (setq used (cons label used)
+                            entries (cons (cons label argv) entries)))))))))))
+    (nreverse entries)))
+
+(defun exwm-launch-app ()
+  "Launch an application from a .desktop file.
+Completion uses `XDG_DATA_HOME' and `XDG_DATA_DIRS'.  Hidden
+entries and entries that are not applications are skipped.
+Field codes are removed from Exec.  `start-process' runs the
+result, so `exwm-manage-startup-id' can place the window.
+No key is bound."
+  (interactive)
+  (let ((entries (exwm-launch--entries)))
+    (unless entries
+      (user-error "[EXWM] No applications"))
+    (let* ((choice (completing-read "Launch application: " entries nil t))
+           (argv (cdr (assoc choice entries))))
+      (unless (consp argv)
+        (user-error "[EXWM] No Exec line"))
+      (apply #'start-process
+             (concat "exwm-launch-" (car argv)) nil argv))))
+
 (defun exwm--update-desktop (xwin)
   "Update _NET_WM_DESKTOP.
 Argument XWIN contains the X window of the `exwm-mode' buffer."
