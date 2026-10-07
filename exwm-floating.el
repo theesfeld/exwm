@@ -293,6 +293,9 @@ configured dimension is invalid."
                (offset-bottom (- (elt outer-edges 3) (elt window-edges 3)))
                (new-x (- x offset-left border-width))
                (new-y (- y offset-top border-width)))
+          (set-frame-parameter frame 'exwm-floating-inset
+                               (list offset-left offset-top
+                                     offset-right offset-bottom))
           ;; Update the x/y but avoid moving the frame off-screen if it was previously on-screen.
           (when (or (<= screen-x new-x) (< x screen-x)) (setq x new-x))
           (when (or (<= screen-y new-y) (< y screen-y)) (setq y new-y))
