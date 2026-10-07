@@ -1147,8 +1147,9 @@ SYNTHETIC indicates whether the event is a synthetic event."
 
 (defun exwm-manage--exit ()
   "Exit the manage module."
-  ;; A clean exit only.  A crash, or xinit killing Emacs, never gets
-  ;; here.  Emacs is the xinit client, so the X session ends with it.
+  ;; A clean exit only.  A crash never gets here.  `exwm-session'
+  ;; starts Emacs again, and the next startup manages clients that
+  ;; are still children of the root.
   (exwm--log)
   (dolist (pair exwm--id-buffer-alist)
     (exwm-manage--unmanage-window (car pair) 'quit))

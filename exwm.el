@@ -53,9 +53,15 @@
 ;;    (setq exwm-input-global-keys `(([?\s-r] . exwm-reset)))
 ;;    (exwm-wm-mode)
 ;;
-;; 3. Add the following lines to '~/.xinitrc':
+;; 3. Run `exwm-session' from '~/.xinitrc':
 ;;
-;;    exec emacs
+;;    exec /path/to/exwm-session
+;;
+;;    That script is the xinit client.  It starts Emacs, and starts
+;;    Emacs again when Emacs dies from a fatal signal.  A normal quit
+;;    ends the session.  Clients still on the root are managed again.
+;;    A client reparented into a window Emacs created dies with it.
+;;    `exec emacs' makes that crash tear the X server down.
 ;;
 ;; 4. Launch EXWM in a console (e.g. tty1) with
 ;;
@@ -1216,11 +1222,11 @@ FRAME, if given, indicates the X display EXWM should manage."
 ;; and replaces itself with the program, so the waited-for process is
 ;; that program and standard input is the real file.
 ;;
-;; A fatal Emacs crash, or xinit tearing Emacs down, cannot be
-;; survived from inside this process.  Emacs is the xinit client
-;; (`exec emacs').  `exwm-manage--exit' unmanages clients only on a
-;; clean exit, and a crash never reaches it.  This is not an
-;; out-of-process window manager.
+;; A fatal Emacs crash never reaches this code.  `exwm-session' is the
+;; xinit client and starts Emacs again after a fatal signal.  EXWM then
+;; manages clients that are still children of the root.  A client
+;; reparented into a window this process created dies with that window.
+;; `exwm-manage--exit' runs only on a clean exit.
 
 (defvar exwm--in-call-process nil
   "Non-nil while EXWM is waiting for a synchronous subprocess.")
@@ -1601,8 +1607,8 @@ whole buffer, including text hidden by narrowing."
   "Run `call-process' without stopping the X connection.
 ORIG is the unadvised subr.  PROGRAM, INFILE, DESTINATION, DISPLAY,
 and ARGS are its arguments.  DESTINATION 0 still uses ORIG, because
-that call does not wait.  A fatal Emacs crash cannot be survived
-here: Emacs is the xinit client."
+that call does not wait.  A fatal crash never returns here;
+`exwm-session' starts Emacs again."
   (cond
    ((not (and (stringp program) (exwm--call-process-pump-p)))
     (apply orig program infile destination display args))
