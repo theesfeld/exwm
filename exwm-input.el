@@ -277,6 +277,7 @@ Current buffer will be the `exwm-mode' buffer when this hook runs.")
 (defvar exwm-workspace--current)
 (defvar exwm-floating-border-color-focused)
 (declare-function exwm-floating-refresh-borders "exwm-floating.el" ())
+(declare-function exwm-floating--raise-emacs-frame "exwm-floating.el" (frame))
 (declare-function exwm-floating--do-moveresize "exwm-floating.el"
                   (data _synthetic))
 (declare-function exwm-floating--start-moveresize "exwm-floating.el"
@@ -516,6 +517,15 @@ attempt later."
                            ;; selected frame.
                            (window-frame (minibuffer-window)))))
               (x-focus-frame frame)
+              (when (frame-parameter frame 'exwm-floating-emacs)
+                (let ((workspace (frame-parameter frame
+                                                  'exwm-floating-workspace)))
+                  (when (and (frame-live-p workspace)
+                             (not (eq workspace exwm-workspace--current)))
+                    (set-frame-parameter workspace 'exwm-selected-window
+                                         window)
+                    (exwm--defer 0 #'exwm-workspace-switch workspace)))
+                (exwm-floating--raise-emacs-frame frame))
               (exwm-input--set-active-window
                (or (frame-parameter exwm-workspace--current 'exwm-outer-id)
                    xcb:Window:None)))

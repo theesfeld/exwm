@@ -96,6 +96,8 @@ inside a correctly sized container."
 (declare-function exwm-workspace-move-window "exwm-workspace.el"
                   (frame-or-index &optional id))
 (declare-function exwm-workspace--raise-child-frames "exwm-workspace.el" ())
+(declare-function exwm-floating--refresh-emacs-frame "exwm-floating.el"
+                  (frame))
 
 (defun exwm-layout--set-state (id state)
   "Set WM_STATE of X window ID to STATE."
@@ -408,15 +410,19 @@ If FRAME is nil, refresh layout of selected frame."
 (defun exwm-layout--refresh-floating (frame)
   "Refresh floating frame FRAME."
   (exwm--log "Refresh floating %s" frame)
-  (let ((window (frame-first-window frame)))
-    (with-current-buffer (window-buffer window)
-      (when (and (derived-mode-p 'exwm-mode)
-                 ;; It may be a buffer waiting to be killed.
-                 (exwm--id->buffer exwm--id))
-        (exwm--log "Refresh floating window #x%x" exwm--id)
-        (if (exwm-workspace--active-p exwm--frame)
-            (exwm-layout--show exwm--id window)
-          (exwm-layout--hide exwm--id))))))
+  (if (frame-parameter frame 'exwm-floating-emacs)
+      ;; An ordinary Emacs buffer has no X client to show.  Fit the
+      ;; container to the frame, or park it with its workspace.
+      (exwm-floating--refresh-emacs-frame frame)
+    (let ((window (frame-first-window frame)))
+      (with-current-buffer (window-buffer window)
+        (when (and (derived-mode-p 'exwm-mode)
+                   ;; It may be a buffer waiting to be killed.
+                   (exwm--id->buffer exwm--id))
+          (exwm--log "Refresh floating window #x%x" exwm--id)
+          (if (exwm-workspace--active-p exwm--frame)
+              (exwm-layout--show exwm--id window)
+            (exwm-layout--hide exwm--id)))))))
 
 (defun exwm-layout--refresh-other (frame)
   "Refresh client or nox frame FRAME."
