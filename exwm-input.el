@@ -614,7 +614,8 @@ attempt later."
     (let ((original exwm-input--global-prefix-keys))
       (setq exwm-input--global-prefix-keys nil)
       (dolist (i exwm-input--global-keys)
-        (cl-pushnew (elt i 0) exwm-input--global-prefix-keys))
+        (cl-pushnew (exwm-input--canonicalize-event (elt i 0))
+                    exwm-input--global-prefix-keys))
       (unless (equal original exwm-input--global-prefix-keys)
         (apply #'exwm-input--grab-global-prefix-keys
                (slot-value (xcb:+request-unchecked+reply exwm--connection
@@ -659,8 +660,31 @@ attempt later."
     (apply #'exwm-input--grab-modifiers xwins)
     (xcb:flush exwm--connection)))
 
+(defun exwm-input--canonicalize-event (event)
+  "Return EVENT with modifiers in Emacs's canonical order.
+
+Character events already ignore modifier order.  Symbol events such
+as `s-C-left' and `C-s-left' do not, but the event EXWM receives from
+X is canonical.  `event-convert-list' changes a character event, so
+characters are returned unchanged."
+  (if (or (symbolp event)
+          (and (integerp event)
+               (symbolp (event-basic-type event))))
+      (or (event-convert-list
+           (append (event-modifiers event)
+                   (list (event-basic-type event))))
+          event)
+    event))
+
+(defun exwm-input--canonicalize-key (key)
+  "Return KEY with each event in canonical modifier order."
+  (if (vectorp key)
+      (apply #'vector (mapcar #'exwm-input--canonicalize-event key))
+    key))
+
 (defun exwm-input--set-key (key command)
   "Set KEY to COMMAND."
+  (setq key (exwm-input--canonicalize-key key))
   (exwm--log "key: %s, command: %s" key command)
   (global-set-key key command)
   (cl-pushnew key exwm-input--global-keys))
@@ -768,7 +792,8 @@ Current buffer must be an `exwm-mode' buffer."
       exwm-input--line-mode-cache
       (eq (active-minibuffer-window) (selected-window))
       ;;
-      (memq event exwm-input--global-prefix-keys)
+      (memq (exwm-input--canonicalize-event event)
+            exwm-input--global-prefix-keys)
       (memq event exwm-input-prefix-keys)
       (exwm-input--modifier-event-p event)
       (when overriding-terminal-local-map

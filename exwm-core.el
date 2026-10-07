@@ -84,6 +84,7 @@ nil: Disable timestamp."
 (defvar exwm-input-line-mode-passthrough)
 (defvar exwm-input-prefix-keys)
 (defvar exwm-workspace--list)
+(declare-function exwm-input--canonicalize-event "exwm-input.el" (event))
 (declare-function exwm-input--fake-key "exwm-input.el" (event))
 (declare-function exwm-input--on-KeyPress-line-mode "exwm-input.el"
                   (key-press raw-data))
@@ -331,7 +332,8 @@ One of `line-mode' or `char-mode'.")
   (cond
    ((or exwm-input-line-mode-passthrough
         (active-minibuffer-window)
-        (memq last-input-event exwm-input--global-prefix-keys)
+        (memq (exwm-input--canonicalize-event last-input-event)
+              exwm-input--global-prefix-keys)
         (memq last-input-event exwm-input-prefix-keys)
         (and (fboundp 'exwm-input--modifier-event-p)
              (exwm-input--modifier-event-p last-input-event))
