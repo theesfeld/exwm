@@ -361,7 +361,15 @@ One of `line-mode' or `char-mode'.")
      ["Enlarge window vertically" exwm-layout-enlarge-window]
      ["Enlarge window horizontally" exwm-layout-enlarge-window-horizontally]
      ["Shrink window vertically" exwm-layout-shrink-window]
-     ["Shrink window horizontally" exwm-layout-shrink-window-horizontally])
+     ["Shrink window horizontally" exwm-layout-shrink-window-horizontally]
+     ["Move floating window right" exwm-floating-move-right]
+     ["Move floating window left" exwm-floating-move-left]
+     ["Move floating window up" exwm-floating-move-up]
+     ["Move floating window down" exwm-floating-move-down]
+     ["Grow floating window width" exwm-floating-grow-width]
+     ["Shrink floating window width" exwm-floating-shrink-width]
+     ["Grow floating window height" exwm-floating-grow-height]
+     ["Shrink floating window height" exwm-floating-shrink-height])
     ("Keyboard"
      ["Toggle keyboard mode" exwm-input-toggle-keyboard]
      ["Send key" exwm-input-send-next-key (eq exwm--input-mode 'line-mode)]
