@@ -85,7 +85,10 @@ nil: Disable timestamp."
 (defvar exwm-input-prefix-keys)
 (defvar exwm-workspace--list)
 (declare-function exwm-input--canonicalize-event "exwm-input.el" (event))
-(declare-function exwm-input--fake-key "exwm-input.el" (event))
+(declare-function exwm-input--fake-key "exwm-input.el" (event &optional id))
+(declare-function exwm-input-scroll-other-window "exwm-input.el" (&optional arg))
+(declare-function exwm-input-scroll-other-window-down "exwm-input.el"
+                  (&optional arg))
 (declare-function exwm-input--on-KeyPress-line-mode "exwm-input.el"
                   (key-press raw-data))
 (declare-function exwm-floating-hide "exwm-floating.el")
@@ -330,7 +333,9 @@ One of `line-mode' or `char-mode'.")
   "C-c C-m" #'exwm-workspace-move-window
   "C-c C-q" #'exwm-input-send-next-key
   "C-c C-t C-f" #'exwm-floating-toggle-floating
-  "C-c C-t C-m" #'exwm-layout-toggle-mode-line)
+  "C-c C-t C-m" #'exwm-layout-toggle-mode-line
+  "C-M-v" #'exwm-input-scroll-other-window
+  "C-M-S-v" #'exwm-input-scroll-other-window-down)
 
 (defun exwm--kmacro-self-insert-command ()
   "The EXWM kmacro equivalent of `self-insert-command'."
