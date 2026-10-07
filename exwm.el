@@ -802,21 +802,34 @@ DATA contains unmarshalled PropertyNotify event data."
       ;; back of the buffer switch list.
       (bury-buffer buffer))))
 
+(defvar exwm-manage--_NET_STARTUP_INFO)
+(defvar exwm-manage--_NET_STARTUP_INFO_BEGIN)
+(declare-function exwm-manage--on-startup-info "exwm-manage.el"
+                  (window data begin))
+
 (defun exwm--on-ClientMessage (raw-data _synthetic)
   "Handle ClientMessage event.
 RAW-DATA contains unmarshalled ClientMessage event data."
   (let* ((obj (xcb:unmarshal-new 'xcb:ClientMessage raw-data))
          (type (slot-value obj 'type))
          (id (slot-value obj 'window))
-         (data (slot-value (slot-value obj 'data) 'data32))
+         (data (slot-value obj 'data))
          (fn (alist-get type exwm--client-message-functions)))
-    (if (not fn)
-        (exwm--log "Unhandled: %s(%d)"
-                   (x-get-atom-name type exwm-workspace--current) type)
+    (cond
+     ((and (= (slot-value obj 'format) 8)
+           (memq type (list exwm-manage--_NET_STARTUP_INFO
+                            exwm-manage--_NET_STARTUP_INFO_BEGIN)))
+      (exwm-manage--on-startup-info
+       id data
+       (eq type exwm-manage--_NET_STARTUP_INFO_BEGIN)))
+     ((not fn)
+      (exwm--log "Unhandled: %s(%d)"
+                 (x-get-atom-name type exwm-workspace--current) type))
+     (t
       (exwm--log "atom=%s(%s) id=#x%x data=%s"
                  (x-get-atom-name type exwm-workspace--current)
-                 type (or id 0) data)
-      (funcall fn id data))))
+                 type (or id 0) (slot-value data 'data32))
+      (funcall fn id (slot-value data 'data32))))))
 
 (defun exwm--on-SelectionClear (data _synthetic)
   "Handle SelectionClear events.
@@ -1112,7 +1125,10 @@ FRAME, if given, indicates the X display EXWM should manage."
                                  :window exwm--root
                                  :value-mask xcb:CW:EventMask
                                  :event-mask
-                                 xcb:EventMask:SubstructureRedirect))
+                                 ;; PropertyChange delivers
+                                 ;; `_NET_STARTUP_INFO' client messages.
+                                 (logior xcb:EventMask:SubstructureRedirect
+                                         xcb:EventMask:PropertyChange)))
           (error "Other window manager is running"))
         ;; Disable some features not working well with EXWM
         (setq use-dialog-box nil

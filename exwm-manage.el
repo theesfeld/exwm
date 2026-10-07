@@ -42,6 +42,26 @@ This hook runs in the context of the corresponding `exwm-mode' buffer."
 You can still make the X windows floating afterwards."
   :type 'boolean)
 
+(defcustom exwm-manage-startup-id t
+  "Non-nil to place windows using startup notifications.
+
+A program Emacs starts is recorded against the workspace and window
+that were current at launch.  If that workspace is still current when
+the window appears, the window is shown there.  If you have switched
+workspace, the window is placed on the workspace where it was started
+and the workspace you are on is left as it is.  When the original
+window no longer exists, the buffer is left on that workspace and the
+selected window is not changed.
+
+Launchers that send `_NET_STARTUP_INFO' can name a workspace with
+DESKTOP.  That workspace is used when the program was not started by
+Emacs.
+
+Set this to nil to keep the old behavior: a new window opens on the
+workspace that is current when it appears."
+  :type 'boolean
+  :initialize #'custom-initialize-default)
+
 (defcustom exwm-manage-ping-timeout 3
   "Seconds to wait before killing a client."
   :type 'integer)
@@ -146,6 +166,29 @@ want to match against EXWM internal variables such as `exwm-title',
 
 (defvar exwm-manage--desktop nil "The desktop X window.")
 
+(defvar exwm-manage--startup-records nil
+  "Alist of startup notifications.
+Each element is (ID WORKSPACE-INDEX WINDOW TIME).  ID is the
+startup-notification string.  WINDOW is the Emacs window selected
+when Emacs launched the program, or nil for an external launcher.
+TIME is `float-time' when the record was created.")
+
+(defvar exwm-manage--startup-sequence 0
+  "Counter mixed into startup-notification ids.")
+
+(defvar exwm-manage--startup-message nil
+  "Startup-notification message still being assembled.")
+
+(defvar exwm-manage--display-window nil
+  "Window in which to place a client without selecting it.
+Bound while managing a window whose startup workspace is no longer
+current.")
+
+(defvar exwm-manage--_NET_STARTUP_ID nil)
+(defvar exwm-manage--_NET_STARTUP_INFO nil)
+(defvar exwm-manage--_NET_STARTUP_INFO_BEGIN nil)
+(defvar exwm-manage--wm-client-leader nil)
+
 (defvar exwm-manage--frame-outer-id-list nil
   "List of window-outer-id's of all frames.")
 
@@ -180,6 +223,8 @@ want to match against EXWM internal variables such as `exwm-title',
 (declare-function exwm-workspace--update-struts "exwm-workspace.el" ())
 (declare-function exwm-workspace--update-workareas "exwm-workspace.el" ())
 (declare-function exwm-workspace--workarea "exwm-workspace.el" (frame))
+(declare-function exwm-workspace--active-p "exwm-workspace.el" (frame))
+(declare-function exwm-layout--hide "exwm-layout.el" (id))
 
 (defun exwm-manage-get-pid (&optional id)
   "Return the PID of the X window ID, if known.
@@ -275,6 +320,234 @@ This only works when procfs is mounted, which may not be the case on some BSDs."
         (when (with-demoted-errors "Problematic configuration: %S"
                 (eval (car i) t))
           (cl-return-from exwm-manage--get-configurations (cdr i)))))))
+
+(defun exwm-manage--startup-field (message key)
+  "Return the value of KEY in startup-notification MESSAGE."
+  (when (and (stringp message)
+             (string-match
+              (concat (regexp-quote key)
+                      "=\\(?:\"\\([^\"]*\\)\"\\|\\([^[:space:]]+\\)\\)")
+              message))
+    (or (match-string 1 message) (match-string 2 message))))
+
+(defun exwm-manage--expire-startup ()
+  "Drop startup records older than five minutes."
+  (let ((limit (- (float-time) 300))
+        keep)
+    (dolist (rec exwm-manage--startup-records)
+      (when (>= (or (nth 3 rec) 0) limit)
+        (push rec keep)))
+    (setq exwm-manage--startup-records (nreverse keep))))
+
+(defun exwm-manage--consume-startup-message (message)
+  "Record or drop a complete startup-notification MESSAGE."
+  (let ((id (exwm-manage--startup-field message "ID"))
+        (desktop (exwm-manage--startup-field message "DESKTOP"))
+        (index nil))
+    (when (and desktop (string-match-p "\\`[0-9]+\\'" desktop))
+      (setq index (string-to-number desktop)))
+    (cond ((or (null id) (string-prefix-p "remove:" message))
+           (when id
+             (setq exwm-manage--startup-records
+                   (assoc-delete-all id exwm-manage--startup-records))))
+          ((or (string-prefix-p "new:" message)
+               (string-prefix-p "change:" message))
+           (let ((old (assoc id exwm-manage--startup-records)))
+             (if old
+                 (when index
+                   (setcar (cdr old) index))
+               (push (list id (or index exwm-workspace-current-index)
+                           nil (float-time))
+                     exwm-manage--startup-records)))))))
+
+(defun exwm-manage--client-bytes (data)
+  "Return the 20 bytes carried by client-message DATA."
+  (let ((bytes (ignore-errors (slot-value data 'data8))))
+    (if (and (sequencep bytes) (= (length bytes) 20))
+        (append bytes nil)
+      (let ((words (append (ignore-errors (slot-value data 'data32)) nil))
+            out)
+        (dolist (word words)
+          (setq word (or word 0)
+                out (nconc out (list (logand word #xff)
+                                     (logand (ash word -8) #xff)
+                                     (logand (ash word -16) #xff)
+                                     (logand (ash word -24) #xff)))))
+        out))))
+
+(defun exwm-manage--bytes-to-string (value)
+  "Decode a property or message VALUE into a string."
+  (let ((text
+         (cond ((not value) nil)
+               ((stringp value)
+                (substring value 0
+                           (or (cl-position 0 value) (length value))))
+               ((sequencep value)
+                (let* ((bytes (append value nil))
+                       (end (cl-position 0 bytes)))
+                  (when end
+                    (setq bytes (seq-take bytes end)))
+                  (decode-coding-string
+                   (apply #'unibyte-string bytes) 'utf-8 t))))))
+    (and (stringp text) (> (length text) 0) text)))
+
+(defun exwm-manage--on-startup-info (_window data begin)
+  "Assemble a `_NET_STARTUP_INFO' message from DATA.
+BEGIN non-nil starts a new message."
+  (let* ((bytes (exwm-manage--client-bytes data))
+         (end (cl-position 0 bytes))
+         (chunk (exwm-manage--bytes-to-string
+                 (if end (seq-take bytes end) bytes))))
+    (when begin
+      (setq exwm-manage--startup-message nil))
+    (setq exwm-manage--startup-message
+          (concat exwm-manage--startup-message chunk))
+    (when end
+      (exwm-manage--consume-startup-message exwm-manage--startup-message)
+      (setq exwm-manage--startup-message nil))))
+
+(defun exwm-manage--property-value (window atom)
+  "Return the raw value of ATOM on WINDOW, or nil."
+  (let ((reply (xcb:+request-unchecked+reply exwm--connection
+                   (make-instance 'xcb:GetProperty
+                                  :delete 0
+                                  :window window
+                                  :property atom
+                                  :type xcb:GetPropertyType:Any
+                                  :long-offset 0
+                                  :long-length 256))))
+    (when (and reply (> (or (slot-value reply 'value-len) 0) 0))
+      (slot-value reply 'value))))
+
+(defun exwm-manage--leader-window (window)
+  "Return WM_CLIENT_LEADER of WINDOW, or nil."
+  (let ((value (and exwm-manage--wm-client-leader
+                    (exwm-manage--property-value
+                     window exwm-manage--wm-client-leader))))
+    (cond ((numberp value) value)
+          ((and (sequencep value) (not (stringp value)) (> (length value) 0))
+           (elt value 0)))))
+
+(defun exwm-manage--read-startup-id (window)
+  "Return the `_NET_STARTUP_ID' of WINDOW, checking its leader."
+  (when exwm-manage--_NET_STARTUP_ID
+    (or (exwm-manage--bytes-to-string
+         (exwm-manage--property-value window exwm-manage--_NET_STARTUP_ID))
+        (let ((leader (exwm-manage--leader-window window)))
+          (when (and leader (/= leader 0) (/= leader window))
+            (exwm-manage--bytes-to-string
+             (exwm-manage--property-value
+              leader exwm-manage--_NET_STARTUP_ID)))))))
+
+(defun exwm-manage--startup-index (window)
+  "Return (WORKSPACE-INDEX . EMACS-WINDOW) for WINDOW, or nil."
+  (when exwm-manage-startup-id
+    (exwm-manage--expire-startup)
+    (let* ((sid (exwm-manage--read-startup-id window))
+           (rec (and sid (assoc sid exwm-manage--startup-records)))
+           (index (and rec (nth 1 rec))))
+      (when (and (integerp index)
+                 (<= 0 index)
+                 (< index (length exwm-workspace--list)))
+        (cons index (nth 2 rec))))))
+
+(defun exwm-manage--send-startup-message (text)
+  "Send startup-notification TEXT to the root window."
+  (when (and exwm--connection
+             exwm-manage--_NET_STARTUP_INFO
+             exwm-manage--_NET_STARTUP_INFO_BEGIN)
+    (let ((bytes (append (encode-coding-string text 'utf-8 t) (list 0)))
+          (begin t))
+      (while bytes
+        (let* ((n (min 20 (length bytes)))
+               (chunk (append (seq-take bytes n)
+                              (make-list (- 20 n) 0))))
+          (setq bytes (nthcdr n bytes))
+          (xcb:+request exwm--connection
+              (make-instance 'xcb:SendEvent
+                             :propagate 0
+                             :destination exwm--root
+                             :event-mask xcb:EventMask:PropertyChange
+                             :event (xcb:marshal
+                                     (make-instance
+                                      'xcb:ClientMessage
+                                      :format 8
+                                      :window exwm--root
+                                      :type (if begin
+                                                exwm-manage--_NET_STARTUP_INFO_BEGIN
+                                              exwm-manage--_NET_STARTUP_INFO)
+                                      :data (make-instance 'xcb:ClientMessageData
+                                                           :data8 chunk))
+                                     exwm--connection)))
+          (setq begin nil)))
+      (xcb:flush exwm--connection))))
+
+(defun exwm-manage--finish-startup (window)
+  "End WINDOW's startup notification, if it has one."
+  (let ((sid (exwm-manage--read-startup-id window)))
+    (when sid
+      (setq exwm-manage--startup-records
+            (assoc-delete-all sid exwm-manage--startup-records))
+      (exwm-manage--send-startup-message (format "remove: ID=\"%s\"" sid)))))
+
+(defun exwm-manage--new-startup-id ()
+  "Return a new startup-notification id."
+  (format "exwm-%s-%s_TIME%s"
+          (emacs-pid)
+          (setq exwm-manage--startup-sequence
+                (1+ exwm-manage--startup-sequence))
+          (floor (* (float-time) 1000))))
+
+(defun exwm-manage--remember-startup (id)
+  "Remember ID against the current workspace and selected window."
+  (exwm-manage--expire-startup)
+  (push (list id
+              exwm-workspace-current-index
+              (or (minibuffer-selected-window) (selected-window))
+              (float-time))
+        exwm-manage--startup-records))
+
+(defun exwm-manage--startup-env-p (args)
+  "Whether make-process ARGS already carry DESKTOP_STARTUP_ID."
+  (let ((env (if (plist-member args :environment)
+                 (plist-get args :environment)
+               process-environment)))
+    (catch 'found
+      (dolist (entry env)
+        (when (and (stringp entry)
+                   (string-prefix-p "DESKTOP_STARTUP_ID=" entry))
+          (throw 'found t))))))
+
+(defun exwm-manage--startup-environment (args id)
+  "Return the environment of ARGS with DESKTOP_STARTUP_ID set to ID."
+  (let ((env (if (plist-member args :environment)
+                 (plist-get args :environment)
+               process-environment))
+        cleaned)
+    (dolist (entry env)
+      (unless (and (stringp entry)
+                   (string-prefix-p "DESKTOP_STARTUP_ID=" entry))
+        (push entry cleaned)))
+    (cons (concat "DESKTOP_STARTUP_ID=" id) (nreverse cleaned))))
+
+(defun exwm-manage--startup-make-process (args)
+  "Add a startup id to `make-process' ARGS when EXWM should track it."
+  (if (not (and exwm-manage-startup-id
+                exwm--connection
+                (slot-value exwm--connection 'connected)
+                (not (file-remote-p default-directory))
+                (plist-get args :command)
+                (not (exwm-manage--startup-env-p args))))
+      args
+    (let ((id (exwm-manage--new-startup-id))
+          (args (copy-sequence args)))
+      (exwm-manage--remember-startup id)
+      (setq args (plist-put args :environment
+                            (exwm-manage--startup-environment args id)))
+      (exwm-manage--send-startup-message
+       (format "new: ID=\"%s\" NAME=\"Emacs\" DESKTOP=%d"
+               id exwm-workspace-current-index))
+      args)))
 
 (defun exwm-manage--manage-window (id)
   "Manage window ID."
@@ -383,11 +656,30 @@ This only works when procfs is mounted, which may not be the case on some BSDs."
               (exwm-input--skip-buffer-list-update t))
           (kill-buffer (current-buffer)))
         (throw 'return 'ignored))
-      (let ((index (plist-get exwm--configurations 'workspace)))
-        (when (and index (< index (length exwm-workspace--list)))
-          (setq exwm--frame (elt exwm-workspace--list index))))
-      ;; Manage the window
-      (exwm--log "Manage #x%x" id)
+      (let* ((configured (plist-get exwm--configurations 'workspace))
+             (use-configured (and (integerp configured)
+                                  (<= 0 configured)
+                                  (< configured (length exwm-workspace--list))))
+             (startup (unless use-configured
+                        (exwm-manage--startup-index id)))
+             (index (cond (use-configured configured)
+                          (startup (car startup))))
+             ;; A startup id for another workspace must not pull the
+             ;; user back there.  A manage-configuration workspace keeps
+             ;; the previous behavior and does select that workspace.
+             (exwm-manage--display-window
+              (when (and startup index
+                         (/= index exwm-workspace-current-index))
+                (let ((frame (elt exwm-workspace--list index))
+                      (window (cdr startup)))
+                  (if (and (window-live-p window)
+                           (eq (window-frame window) frame))
+                      window
+                    (frame-selected-window frame))))))
+        (when index
+          (setq exwm--frame (elt exwm-workspace--list index)))
+        ;; Manage the window
+        (exwm--log "Manage #x%x" id)
       (xcb:+request exwm--connection    ;remove border
           (make-instance 'xcb:ConfigureWindow
                          :window id :value-mask xcb:ConfigWindow:BorderWidth
@@ -406,19 +698,32 @@ This only works when procfs is mounted, which may not be the case on some BSDs."
       (xcb:flush exwm--connection)
       (setq exwm--stay-tiled
             (and (plist-get exwm--configurations 'stay-tiled) t))
-      (if (or exwm--stay-tiled
-              (and (plist-member exwm--configurations 'floating)
-                   (not (plist-get exwm--configurations 'floating)))
-              (and (not (plist-member exwm--configurations 'floating))
-                   (or exwm-manage-force-tiling
-                       (not (or exwm-transient-for exwm--fixed-size
-                                (memq xcb:Atom:_NET_WM_WINDOW_TYPE_UTILITY
-                                      exwm-window-type)
-                                (memq xcb:Atom:_NET_WM_WINDOW_TYPE_DIALOG
-                                      exwm-window-type))))))
-          (with-selected-window (frame-selected-window exwm--frame)
-            (exwm-floating--unset-floating id))
-        (exwm-floating--set-floating id))
+      (let ((exwm-input--skip-buffer-list-update
+             (or exwm-manage--display-window
+                 exwm-input--skip-buffer-list-update))
+            (origin (selected-frame)))
+        (if (or exwm--stay-tiled
+                (and (plist-member exwm--configurations 'floating)
+                     (not (plist-get exwm--configurations 'floating)))
+                (and (not (plist-member exwm--configurations 'floating))
+                     (or exwm-manage-force-tiling
+                         (not (or exwm-transient-for exwm--fixed-size
+                                  (memq xcb:Atom:_NET_WM_WINDOW_TYPE_UTILITY
+                                        exwm-window-type)
+                                  (memq xcb:Atom:_NET_WM_WINDOW_TYPE_DIALOG
+                                        exwm-window-type))))))
+            (if exwm-manage--display-window
+                (exwm-floating--unset-floating id)
+              (with-selected-window (frame-selected-window exwm--frame)
+                (exwm-floating--unset-floating id)))
+          (exwm-floating--set-floating id))
+        (when (and exwm-manage--display-window
+                   (frame-live-p origin)
+                   (not (eq (selected-frame) origin)))
+          (select-frame origin 'norecord))
+        (when (and exwm-manage--display-window
+                   (not (exwm-workspace--active-p exwm--frame)))
+          (exwm-layout--hide id)))
       (if (plist-get exwm--configurations 'char-mode)
           (exwm-input-release-keyboard id)
         (exwm-input-grab-keyboard id))
@@ -435,7 +740,8 @@ This only works when procfs is mounted, which may not be the case on some BSDs."
         (setq exwm--ewmh-state (delq xcb:Atom:_NET_WM_STATE_FULLSCREEN
                                      exwm--ewmh-state))
         (exwm-layout-set-fullscreen id))
-      (run-hooks 'exwm-manage-finish-hook))))
+      (exwm-manage--finish-startup id)
+      (run-hooks 'exwm-manage-finish-hook)))))
 
 (defun exwm-manage--unmanage-window (id &optional withdraw-only)
   "Unmanage window ID.
@@ -810,7 +1116,15 @@ SYNTHETIC indicates whether the event is a synthetic event."
   ;; Intern _MOTIF_WM_HINTS
   (exwm--log)
   (setq exwm-manage--_MOTIF_WM_HINTS (exwm--intern-atom "_MOTIF_WM_HINTS")
+        exwm-manage--_NET_STARTUP_ID (exwm--intern-atom "_NET_STARTUP_ID")
+        exwm-manage--_NET_STARTUP_INFO (exwm--intern-atom "_NET_STARTUP_INFO")
+        exwm-manage--_NET_STARTUP_INFO_BEGIN
+        (exwm--intern-atom "_NET_STARTUP_INFO_BEGIN")
+        exwm-manage--wm-client-leader (exwm--intern-atom "WM_CLIENT_LEADER")
+        exwm-manage--startup-records nil
+        exwm-manage--startup-message nil
         exwm-manage--frame-outer-id-list nil)
+  (advice-add 'make-process :filter-args #'exwm-manage--startup-make-process)
   (dolist (frame (frame-list))
     (when (display-graphic-p frame)
       (exwm-manage--add-frame frame)))
@@ -831,7 +1145,14 @@ SYNTHETIC indicates whether the event is a synthetic event."
     (exwm-manage--unmanage-window (car pair) 'quit))
   (remove-hook 'after-make-frame-functions #'exwm-manage--add-frame)
   (remove-hook 'delete-frame-functions #'exwm-manage--remove-frame)
-  (setq exwm-manage--_MOTIF_WM_HINTS nil))
+  (advice-remove 'make-process #'exwm-manage--startup-make-process)
+  (setq exwm-manage--_MOTIF_WM_HINTS nil
+        exwm-manage--_NET_STARTUP_ID nil
+        exwm-manage--_NET_STARTUP_INFO nil
+        exwm-manage--_NET_STARTUP_INFO_BEGIN nil
+        exwm-manage--wm-client-leader nil
+        exwm-manage--startup-records nil
+        exwm-manage--startup-message nil))
 
 (provide 'exwm-manage)
 ;;; exwm-manage.el ends here
