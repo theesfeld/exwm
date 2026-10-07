@@ -1631,6 +1631,17 @@ DISPLAY, and ARGS are its arguments.  BUFFER 0 still uses ORIG."
       (exwm--call-process-region-body
        start end program delete buffer display args)))))
 
+(defun exwm--suspend-frame (orig-fun &rest args)
+  "Refuse to suspend or iconify an EXWM workspace.
+ORIG-FUN is `suspend-frame' and ARGS are its arguments.  Iconifying
+the workspace frame takes the X session down.  The keys stay bound
+to `suspend-frame'."
+  (when (and exwm--connection
+             (frame-live-p (selected-frame))
+             (exwm-workspace--workspace-p (selected-frame)))
+    (user-error "[EXWM] Refusing to suspend the workspace"))
+  (apply orig-fun args))
+
 (defun exwm--disable ()
   "Unregister functions for EXWM to be initialized."
   (exwm--log)
@@ -1645,7 +1656,8 @@ DISPLAY, and ARGS are its arguments.  BUFFER 0 still uses ORIG."
   (dolist (i exwm-blocking-subrs)
     (advice-remove i #'exwm--server-eval-at))
   (advice-remove 'call-process #'exwm--call-process)
-  (advice-remove 'call-process-region #'exwm--call-process-region))
+  (advice-remove 'call-process-region #'exwm--call-process-region)
+  (advice-remove 'suspend-frame #'exwm--suspend-frame))
 
 (defun exwm--enable ()
   "Register functions for EXWM to be initialized."
@@ -1673,7 +1685,10 @@ DISPLAY, and ARGS are its arguments.  BUFFER 0 still uses ORIG."
   ;; window manager.
   (exwm--cache-signal-descriptions)
   (advice-add 'call-process :around #'exwm--call-process)
-  (advice-add 'call-process-region :around #'exwm--call-process-region))
+  (advice-add 'call-process-region :around #'exwm--call-process-region)
+  ;; C-z and C-x C-z run `suspend-frame'.  Iconifying a workspace takes
+  ;; the session down.  Leave the keys bound and refuse only then.
+  (advice-add 'suspend-frame :around #'exwm--suspend-frame))
 
 (defun exwm--server-stop ()
   "Stop the subordinate Emacs server."
