@@ -464,6 +464,16 @@ until the selected window stops changing (debouncing input focus updates)."
                         nil
                         #'exwm-input--update-focus-commit)))
 
+(defun exwm-input-refresh-focus ()
+  "Schedule input focus for the selected window.
+`exwm-workspace-switch' does this itself.  Call this after another
+command selects an EXWM window without switching workspace, for
+example a perspective switch.  The change is deferred in the same
+way as `buffer-list-update-hook'."
+  (interactive)
+  (setq exwm-input--update-focus-window (selected-window))
+  (exwm-input--update-focus-defer))
+
 (defun exwm-input--update-focus-commit ()
   "Attempt to update the window focus.
 If we're currently updating the window focus, re-schedule a focus update

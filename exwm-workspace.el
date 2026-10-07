@@ -178,6 +178,8 @@ Stops a client that immediately reparents the frame back from looping.")
 (defvar exwm-layout-show-all-buffers)
 (defvar exwm-manage--desktop)
 (declare-function exwm-input--on-buffer-list-update "exwm-input.el" ())
+(declare-function exwm-input--update-focus-defer "exwm-input.el" ())
+(defvar exwm-input--update-focus-window)
 (declare-function exwm-layout--fullscreen-p "exwm-layout.el" ())
 (declare-function exwm-layout--hide "exwm-layout.el" (id))
 (declare-function exwm-layout--other-buffer-predicate "exwm-layout.el"
@@ -610,8 +612,10 @@ When FORCE is true, allow switching to current workspace."
   (let* ((frame (exwm-workspace--workspace-from-frame-or-index frame-or-index))
          (old-frame exwm-workspace--current)
          (index (exwm-workspace--position frame))
-         (window (frame-parameter frame 'exwm-selected-window)))
+         (window (frame-parameter frame 'exwm-selected-window))
+         switched)
     (when (or force (not (eq frame exwm-workspace--current)))
+      (setq switched t)
       (unless (window-live-p window)
         (setq window (frame-selected-window frame)))
     (when (and (not (eq frame old-frame))
@@ -714,6 +718,13 @@ When FORCE is true, allow switching to current workspace."
                              :dst-y (/ (frame-pixel-height frame) 2)))
           (xcb:flush exwm--connection))))
     (funcall exwm-workspace--original-handle-focus-in (list 'focus-in frame))
+    ;; `x-focus-frame' focuses the Emacs frame.  The X client is
+    ;; focused from `buffer-list-update-hook', and that hook does not
+    ;; run when the selected buffer stays where it is in the buffer
+    ;; list.  The window is then visible and ignores the keyboard.
+    (when (and switched (window-live-p window))
+      (setq exwm-input--update-focus-window window)
+      (exwm-input--update-focus-defer))
     (run-hooks 'exwm-workspace-switch-hook)))
 
 (defun exwm-workspace-switch-previous ()
