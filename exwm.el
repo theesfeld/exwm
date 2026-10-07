@@ -41,6 +41,7 @@
 ;; + Input method
 ;; + Background setting support
 ;; + XSETTINGS server
+;; + CLIPBOARD text kept on the kill ring after the owning client exits
 
 ;; Installation & configuration
 ;; ----------------------------
@@ -78,6 +79,7 @@
 (require 'exwm-floating)
 (require 'exwm-manage)
 (require 'exwm-input)
+(require 'exwm-clipboard)
 
 (declare-function x-get-atom-name "C source code" (VALUE &optional FRAME))
 
@@ -1145,6 +1147,7 @@ FRAME, if given, indicates the X display EXWM should manage."
         (exwm-manage--init)
         (exwm-workspace--init)
         (exwm-input--init)
+        (exwm-clipboard--init)
         (exwm--unlock)
         (exwm-workspace--post-init)
         (exwm-input--post-init)
@@ -1168,6 +1171,8 @@ FRAME, if given, indicates the X display EXWM should manage."
   (exwm-workspace--exit)
   (exwm-floating--exit)
   (exwm-layout--exit)
+  (exwm-clipboard--exit)
+  (exwm-clipboard--reset)
   (xcb:flush exwm--connection)
   (xcb:disconnect exwm--connection)
   (setq exwm--connection nil
