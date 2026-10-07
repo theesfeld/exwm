@@ -185,14 +185,28 @@ See variable `exwm-layout-auto-iconify'."
       (exwm-layout--auto-iconify)
       (xcb:flush exwm--connection))))
 
-(cl-defun exwm-layout-set-fullscreen (&optional id)
-  "Make window ID fullscreen."
+(defvar-local exwm--window-dedicated-before-fullscreen nil
+  "Value of `window-dedicated-p' saved by `exwm-layout-set-fullscreen'.")
+
+(defvar-local exwm--fullscreen-hold nil
+  "Non-nil when the user left fullscreen and the client must not restore it.")
+
+(cl-defun exwm-layout-set-fullscreen (&optional id user)
+  "Make window ID fullscreen.
+When USER is non-nil, this is a user request and a previous choice to
+stay out of fullscreen is cleared.  A client request is ignored while
+that choice is in effect."
   (interactive)
+  (when (called-interactively-p 'any)
+    (setq user t))
   (exwm--log "id=#x%x" (or id 0))
   (unless (and (or id (derived-mode-p 'exwm-mode))
                (not (exwm-layout--fullscreen-p)))
     (cl-return-from exwm-layout-set-fullscreen))
   (with-current-buffer (if id (exwm--id->buffer id) (window-buffer))
+    (when (and exwm--fullscreen-hold (not user))
+      (cl-return-from exwm-layout-set-fullscreen))
+    (setq exwm--fullscreen-hold nil)
     ;; Expand the X window to fill the whole screen.
     (with-slots (x y width height) (exwm-workspace--get-geometry exwm--frame)
       (exwm--set-geometry exwm--id x y width height))
@@ -207,18 +221,28 @@ See variable `exwm-layout-auto-iconify'."
     (cl-pushnew xcb:Atom:_NET_WM_STATE_FULLSCREEN exwm--ewmh-state)
     (exwm-layout--set-ewmh-state exwm--id)
     (xcb:flush exwm--connection)
-    (set-window-dedicated-p (get-buffer-window) t)
+    (let ((window (get-buffer-window nil t)))
+      (when (window-live-p window)
+        (setq exwm--window-dedicated-before-fullscreen
+              (window-dedicated-p window))
+        (set-window-dedicated-p window t)))
     (when exwm-layout-fullscreen-release-keyboard
       (exwm-input--release-keyboard exwm--id))))
 
-(cl-defun exwm-layout-unset-fullscreen (&optional id)
-  "Restore X window ID from fullscreen state."
+(cl-defun exwm-layout-unset-fullscreen (&optional id user)
+  "Restore X window ID from fullscreen state.
+When USER is non-nil, later client requests to enter fullscreen are
+ignored until the user enters fullscreen again."
   (interactive)
+  (when (called-interactively-p 'any)
+    (setq user t))
   (exwm--log "id=#x%x" (or id 0))
   (unless (and (or id (derived-mode-p 'exwm-mode))
                (exwm-layout--fullscreen-p))
     (cl-return-from exwm-layout-unset-fullscreen))
   (with-current-buffer (if id (exwm--id->buffer id) (window-buffer))
+    (when user
+      (setq exwm--fullscreen-hold t))
     ;; `exwm-layout--show' relies on `exwm--ewmh-state' to decide whether to
     ;; fullscreen the window.
     (setq exwm--ewmh-state
@@ -237,7 +261,11 @@ See variable `exwm-layout-auto-iconify'."
         (when window
           (exwm-layout--show exwm--id window))))
     (xcb:flush exwm--connection)
-    (set-window-dedicated-p (get-buffer-window) nil)
+    (let ((window (get-buffer-window nil t)))
+      (when (window-live-p window)
+        (set-window-dedicated-p window
+                                exwm--window-dedicated-before-fullscreen))
+      (setq exwm--window-dedicated-before-fullscreen nil))
     (when (eq 'line-mode exwm--selected-input-mode)
       (exwm-input--grab-keyboard exwm--id))))
 
@@ -248,10 +276,11 @@ If ID is non-nil, default to ID of `window-buffer'."
   (setq id (or id (exwm--buffer->id (current-buffer))
                (user-error "Current buffer has no X window ID")))
   (exwm--log "id=#x%x" id)
-  (with-current-buffer (exwm--id->buffer id)
-    (if (exwm-layout--fullscreen-p)
-        (exwm-layout-unset-fullscreen id)
-      (exwm-layout-set-fullscreen id))))
+  (let ((user (called-interactively-p 'any)))
+    (with-current-buffer (exwm--id->buffer id)
+      (if (exwm-layout--fullscreen-p)
+          (exwm-layout-unset-fullscreen id user)
+        (exwm-layout-set-fullscreen id user)))))
 
 (defun exwm-layout--other-buffer-predicate (buffer)
   "Return non-nil when the BUFFER may be displayed in selected frame.
