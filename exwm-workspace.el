@@ -113,6 +113,9 @@ Please manually run the hook `exwm-workspace-list-change-hook' afterwards.")
 
 (defvar exwm-workspace--current nil "Current active workspace.")
 
+(defvar exwm-workspace--previous nil
+  "Workspace frame selected before `exwm-workspace--current'.")
+
 (defvar exwm-workspace--display-echo-area-timer nil
   "Timer for auto-hiding echo area.")
 
@@ -576,6 +579,7 @@ When FORCE is true, allow switching to current workspace."
         (setq window (frame-selected-window frame)))
     (when (and (not (eq frame old-frame))
                (frame-live-p old-frame))
+      (setq exwm-workspace--previous old-frame)
       (with-selected-frame old-frame
         (funcall exwm-workspace--original-handle-focus-out
                  (list 'focus-out frame))))
@@ -674,6 +678,15 @@ When FORCE is true, allow switching to current workspace."
           (xcb:flush exwm--connection))))
     (funcall exwm-workspace--original-handle-focus-in (list 'focus-in frame))
     (run-hooks 'exwm-workspace-switch-hook)))
+
+(defun exwm-workspace-switch-previous ()
+  "Switch to the workspace that was selected before this one.
+Calling this command twice returns to the workspace it just left."
+  (interactive)
+  (unless (and (frame-live-p exwm-workspace--previous)
+               (exwm-workspace--workspace-p exwm-workspace--previous))
+    (user-error "[EXWM] No previous workspace"))
+  (exwm-workspace-switch exwm-workspace--previous))
 
 (defun exwm-workspace-switch-create (frame-or-index)
   "Switch to workspace FRAME-OR-INDEX creating it first non-existent.

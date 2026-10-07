@@ -99,6 +99,7 @@ nil: Disable timestamp."
                   (frame-or-index &optional id))
 (declare-function exwm-workspace-switch "exwm-workspace.el"
                   (frame-or-index &optional force))
+(declare-function exwm-workspace-switch-previous "exwm-workspace.el" ())
 
 (defvaralias 'exwm-debug 'exwm-debug-mode)
 (define-minor-mode exwm-debug-mode
@@ -398,6 +399,7 @@ One of `line-mode' or `char-mode'.")
      ["Move X window from" exwm-workspace-switch-to-buffer]
      ["Toggle minibuffer" exwm-workspace-toggle-minibuffer]
      ["Switch workspace" exwm-workspace-switch]
+     ["Switch to previous workspace" exwm-workspace-switch-previous]
      ;; Place this entry at bottom to avoid selecting others by accident.
      ("Switch to" :active (cdr exwm-workspace--list) :filter
       ,(lambda (&rest _args)
