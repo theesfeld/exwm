@@ -1193,6 +1193,435 @@ FRAME, if given, indicates the X display EXWM should manage."
       (exwm--exit))
     (exwm--disable)))
 
+;;;; Synchronous subprocesses
+;;
+;; `call-process' does not return to the command loop.  An X client
+;; that maps a window waits in the server until this process reads the
+;; MapRequest, so the desktop freezes for the whole subprocess.  The
+;; advice below runs that subprocess with `make-process' and accepts
+;; output while waiting.  Accepting output reads the X connection, and
+;; XELB's filter dispatches the events.
+;;
+;; Emacs 31.1's `make-process' cannot attach a file to standard input.
+;; A `/bin/sh' exec applies the same redirections `call-process' uses
+;; and replaces itself with the program, so the waited-for process is
+;; that program and standard input is the real file.
+;;
+;; A fatal Emacs crash, or xinit tearing Emacs down, cannot be
+;; survived from inside this process.  Emacs is the xinit client
+;; (`exec emacs').  `exwm-manage--exit' unmanages clients only on a
+;; clean exit, and a crash never reaches it.  This is not an
+;; out-of-process window manager.
+
+(defvar exwm--in-call-process nil
+  "Non-nil while EXWM is waiting for a synchronous subprocess.")
+
+(defvar exwm--signal-descriptions nil
+  "Alist of signal numbers and the text `call-process' returns for them.")
+
+(defvar exwm--signal-descriptions-ready nil
+  "Non-nil once `exwm--cache-signal-descriptions' has run.")
+
+(defconst exwm--call-process-interval 0.05
+  "Seconds to wait between reads of a synchronous subprocess.
+The X connection is read during each wait.")
+
+(defconst exwm--call-process-script
+  "in=$1; out=$2; err=$3; shift 3
+exec < \"$in\" || exit $?
+if [ \"$out\" != - ]; then exec > \"$out\" || exit $?; fi
+if [ \"$err\" = mix ]; then exec 2>&1 || exit $?
+elif [ \"$err\" != - ]; then exec 2> \"$err\" || exit $?; fi
+exec \"$@\""
+  "Shell script that redirects and then execs its command.
+The arguments are the input file, the output file or \"-\", the
+error destination, the program, and the program arguments.  \"-\"
+leaves that descriptor on the pipe.  \"mix\" sends standard error
+to standard output.")
+
+(defun exwm--cache-signal-descriptions ()
+  "Record how `call-process' names terminating signals.
+Stopping signals are not probed: the probe would not return.
+This calls the real subr, so it binds the connection off."
+  (unless exwm--signal-descriptions-ready
+    ;; 19 STOP, 20 TSTP, 21 TTIN, and 22 TTOU stop the process.
+    (let ((exwm--connection nil)
+          (stop '(19 20 21 22))
+          (alist nil))
+      (dolist (sig (number-sequence 1 31))
+        (unless (memq sig stop)
+          (let ((status (ignore-errors
+                          (call-process "/bin/sh" nil nil nil "-c"
+                                        (format "kill -%d $$" sig)))))
+            (when (stringp status)
+              (push (cons sig status) alist)))))
+      (setq exwm--signal-descriptions (nreverse alist)
+            exwm--signal-descriptions-ready t))))
+
+(defun exwm--signal-description (number)
+  "Return the `call-process' description of signal NUMBER."
+  (or (cdr (assq number exwm--signal-descriptions))
+      "unknown"))
+
+(defun exwm--call-process-pump-p ()
+  "Return non-nil when EXWM is connected to a live X server."
+  (and exwm--connection
+       (ignore-errors
+         (process-live-p (slot-value exwm--connection 'process)))))
+
+(defun exwm--call-process-nowait-p (destination)
+  "Return non-nil when DESTINATION tells `call-process' not to wait."
+  (or (integerp destination)
+      (and (consp destination)
+           (not (eq (car destination) :file))
+           (integerp (car destination)))))
+
+(defun exwm--call-process-parse-destination (destination)
+  "Parse DESTINATION the way `call-process' does.
+Return (BUFFER OUTPUT-FILE ERROR-SPEC).  BUFFER is nil, t, a
+buffer, or an integer.  OUTPUT-FILE is a file name or nil.
+ERROR-SPEC is t to mix standard error into standard output, nil
+to discard it, or a file name."
+  (let ((buffer destination)
+        (output-file nil)
+        (error-spec t))
+    (when (and (consp buffer) (not (eq (car buffer) :file)))
+      (when (consp (cdr buffer))
+        (let ((stderr (car (cdr buffer))))
+          (setq error-spec
+                (cond ((null stderr) nil)
+                      ((eq stderr t) t)
+                      ((stringp stderr) (expand-file-name stderr))
+                      (t (signal 'wrong-type-argument
+                                 (list 'stringp stderr)))))))
+      (setq buffer (car buffer)))
+    (when (and (consp buffer) (eq (car buffer) :file))
+      (let ((ofile (cdr buffer)))
+        (when (consp ofile)
+          (setq ofile (car ofile)))
+        (unless (stringp ofile)
+          (signal 'wrong-type-argument (list 'stringp ofile)))
+        (setq output-file (expand-file-name ofile)))
+      (setq buffer nil))
+    (unless (or (null buffer) (eq buffer t) (integerp buffer))
+      (setq buffer (get-buffer-create buffer)))
+    (list buffer output-file error-spec)))
+
+(defun exwm--call-process-targets (buffer output-file error-spec)
+  "Return (STDOUT STDERR) redirections for BUFFER, OUTPUT-FILE, and ERROR-SPEC.
+STDOUT is a file name, or nil to keep the pipe.  STDERR is the
+symbol `mix' or a file name."
+  (let ((discard (and (null buffer) (null output-file))))
+    (list (cond (output-file output-file)
+                (discard null-device)
+                (t nil))
+          (cond ((eq error-spec t) 'mix)
+                ((null error-spec) null-device)
+                (t error-spec)))))
+
+(defun exwm--call-process-command (infile stdout stderr program args)
+  "Return a command list that execs PROGRAM with ARGS.
+INFILE is the input file.  STDOUT is a file name, or nil to keep
+the pipe.  STDERR is `mix' or a file name."
+  (append (list "/bin/sh" "-c" exwm--call-process-script "sh"
+                infile
+                (or stdout "-")
+                (if (eq stderr 'mix) "mix" stderr)
+                program)
+          args))
+
+(defun exwm--call-process-drain (sink marker display)
+  "Move text from SINK to MARKER.
+DISPLAY non-nil redisplays after insertion.  Return the number of
+characters inserted."
+  (if (not (buffer-live-p sink))
+      0
+    (let ((text (with-current-buffer sink
+                  (prog1 (buffer-string)
+                    (erase-buffer)))))
+      (cond
+       ((string-empty-p text) 0)
+       ((not (and marker (buffer-live-p (marker-buffer marker))))
+        0)
+       (t
+        (with-current-buffer (marker-buffer marker)
+          (let ((follow (= (point) (marker-position marker)))
+                (old (copy-marker (point) t)))
+            (goto-char marker)
+            (insert text)
+            (unless follow
+              (goto-char old))
+            (set-marker old nil)))
+        (when display
+          (ignore-errors (redisplay)))
+        (length text))))))
+
+(defun exwm--call-process-quit (proc)
+  "Give PROC SIGINT, or SIGKILL if the user quits again.
+The wait still reads the X connection."
+  (when (process-live-p proc)
+    (ignore-errors (interrupt-process proc))
+    (message "Waiting for process to die...(type C-g again to kill it instantly)")
+    (condition-case nil
+        (while (process-live-p proc)
+          (accept-process-output proc exwm--call-process-interval)
+          (when (and quit-flag (not inhibit-quit))
+            (setq quit-flag nil)
+            (signal 'quit nil)))
+      (quit
+       (when (process-live-p proc)
+         (ignore-errors (delete-process proc)))))
+    (message "Waiting for process to die...done")))
+
+(defun exwm--accept-subprocess (proc sink marker display)
+  "Wait until PROC exits, and return how many characters were inserted.
+SINK and MARKER receive its output when SINK is non-nil.  DISPLAY
+non-nil redisplays as output arrives.  The wait reads every
+process, so the X connection's filter can dispatch events."
+  (let ((inserted 0))
+    (condition-case nil
+        (progn
+          (while (process-live-p proc)
+            (accept-process-output proc exwm--call-process-interval)
+            (when (and quit-flag (not inhibit-quit))
+              (setq quit-flag nil)
+              (signal 'quit nil))
+            (when sink
+              (setq inserted (+ inserted
+                                (exwm--call-process-drain
+                                 sink marker display)))))
+          (while (accept-process-output proc 0))
+          (accept-process-output nil 0)
+          (when sink
+            (setq inserted (+ inserted
+                              (exwm--call-process-drain
+                               sink marker display))))
+          inserted)
+      (quit
+       (exwm--call-process-quit proc)
+       (signal 'quit nil)))))
+
+(defun exwm--call-process-program (program)
+  "Return an absolute PROGRAM, or signal the way `call-process' does."
+  (let ((found (executable-find program))
+        (directory (or (and (file-directory-p program) program)
+                       (locate-file program exec-path exec-suffixes
+                                    #'file-directory-p))))
+    (cond
+     ((and found (not (file-directory-p found)))
+      found)
+     (directory
+      (signal 'file-error
+              (list "Searching for program" "Is a directory" program)))
+     (t
+      (let* ((hit (locate-file program exec-path exec-suffixes #'file-exists-p))
+             (reason (cond ((and hit (not (file-executable-p hit)))
+                            (list 'permission-denied "Permission denied"))
+                           (t
+                            (list 'file-missing "No such file or directory")))))
+        (signal (car reason)
+                (list "Searching for program" (cadr reason) program)))))))
+
+(defun exwm--call-process-input (infile)
+  "Signal unless INFILE can be opened for reading."
+  (cond
+   ((file-readable-p infile) infile)
+   ((not (file-exists-p infile))
+    (signal 'file-missing
+            (list "Opening process input file"
+                  "No such file or directory" infile)))
+   (t
+    (signal 'permission-denied
+            (list "Opening process input file" "Permission denied" infile)))))
+
+(defun exwm--call-process-directory (dir)
+  "Signal unless DIR is a directory a subprocess can enter."
+  (cond
+   ((file-accessible-directory-p dir) dir)
+   ((not (file-exists-p dir))
+    (signal 'file-missing
+            (list "Setting current directory"
+                  "No such file or directory" dir)))
+   ((not (file-directory-p dir))
+    (signal 'file-error
+            (list "Setting current directory" "Not a directory" dir)))
+   (t
+    (signal 'permission-denied
+            (list "Setting current directory" "Permission denied" dir)))))
+
+(defun exwm--call-process-status (proc)
+  "Return the `call-process' status value of PROC."
+  (pcase (process-status proc)
+    ('exit (process-exit-status proc))
+    ('signal (exwm--signal-description (process-exit-status proc)))
+    (_ "internal error")))
+
+(defun exwm--call-process-body (program infile destination display args)
+  "Run PROGRAM the way `call-process' does, pumping the X connection.
+INFILE, DESTINATION, DISPLAY, and ARGS match `call-process'."
+  (exwm--log "%s" program)
+  (dolist (arg args)
+    (unless (stringp arg)
+      (signal 'wrong-type-argument (list 'stringp arg))))
+  (unless (file-executable-p "/bin/sh")
+    (error "Opening subprocess shell: /bin/sh"))
+  (let* ((work-dir default-directory)
+         (local-dir (exwm--call-process-directory
+                    (or (unhandled-file-name-directory default-directory)
+                        (expand-file-name "~")))))
+    (let ((default-directory local-dir))
+      (setq program (exwm--call-process-program program))
+      (setq infile (exwm--call-process-input
+                    (expand-file-name (or infile null-device)))))
+    (pcase-let* ((`(,buffer ,output-file ,error-spec)
+                  (let ((default-directory work-dir))
+                    (exwm--call-process-parse-destination destination)))
+                 (`(,stdout-file ,stderr-target)
+                  (exwm--call-process-targets buffer output-file error-spec))
+                 (out-buf (cond ((eq buffer t) (current-buffer))
+                                ((bufferp buffer) buffer)))
+                 (sink nil)
+                 (marker nil)
+                 (proc nil)
+                 (display-now (and display (not noninteractive))))
+      (when (and (stringp stdout-file)
+                 (not (equal stdout-file null-device)))
+        (write-region "" nil stdout-file nil 'silent))
+      (when (and (stringp stderr-target)
+                 (not (equal stderr-target null-device)))
+        (write-region "" nil stderr-target nil 'silent))
+      (when (null stdout-file)
+        (setq sink (generate-new-buffer " *exwm-call-process*" t))
+        (when out-buf
+          (with-current-buffer sink
+            (set-buffer-multibyte
+             (buffer-local-value 'enable-multibyte-characters out-buf)))
+          (with-current-buffer out-buf
+            (setq marker (copy-marker (point) t)))))
+      (unwind-protect
+          (let ((default-directory local-dir)
+                (inserted 0))
+            (setq proc
+                  (make-process
+                   :name "exwm-call-process"
+                   :buffer sink
+                   :command (exwm--call-process-command
+                             infile stdout-file stderr-target program args)
+                   :connection-type 'pipe
+                   :noquery t
+                   :sentinel #'ignore
+                   :filter (if sink nil #'ignore)
+                   :coding (when (and sink
+                                      (not (with-current-buffer sink
+                                             enable-multibyte-characters)))
+                             '(raw-text-unix . raw-text-unix))))
+            (setq inserted (exwm--accept-subprocess
+                            proc sink marker display-now))
+            (when sink
+              (setq last-coding-system-used
+                    (car (process-coding-system proc)))
+              (when (and out-buf
+                         inherit-process-coding-system
+                         (fboundp 'after-insert-file-set-buffer-file-coding-system))
+                (with-current-buffer out-buf
+                  (after-insert-file-set-buffer-file-coding-system inserted))))
+            (exwm--call-process-status proc))
+        (when (and proc (process-live-p proc))
+          (ignore-errors (delete-process proc)))
+        (when marker
+          (set-marker marker nil))
+        (when (buffer-live-p sink)
+          (with-current-buffer sink
+            (set-buffer-modified-p nil))
+          (let ((kill-buffer-query-functions nil))
+            (kill-buffer sink)))))))
+
+(defun exwm--call-process-region-bounds (start end)
+  "Return input bounds for `call-process-region', or `empty'.
+A string START becomes a one-element list.  Nil START means the
+whole buffer, including text hidden by narrowing."
+  (cond
+   ((stringp start)
+    (if (string-empty-p start) 'empty (list start nil)))
+   ((null start)
+    (if (= (buffer-size) 0) 'empty (list nil nil)))
+   ((not (and (number-or-marker-p start) (number-or-marker-p end)))
+    (signal 'wrong-type-argument
+            (list 'integer-or-marker-p
+                  (if (number-or-marker-p start) end start))))
+   (t
+    (when (> start end)
+      (setq start (prog1 end (setq end start))))
+    (if (= start end) 'empty (list start end)))))
+
+(defun exwm--call-process-region-delete (start end)
+  "Delete the `call-process-region' input described by START and END."
+  (cond
+   ((stringp start)
+    (delete-region start end))
+   ((null start)
+    (save-restriction
+      (widen)
+      (delete-region (point-min) (point-max))))
+   (t
+    (when (and (number-or-marker-p start)
+               (number-or-marker-p end)
+               (> start end))
+      (setq start (prog1 end (setq end start))))
+    (delete-region start end))))
+
+(defun exwm--call-process-region-body (start end program delete
+                                             destination display args)
+  "Run `call-process-region' while pumping the X connection."
+  (let ((bounds (exwm--call-process-region-bounds start end))
+        (temp nil))
+    (unwind-protect
+        (let ((infile nil))
+          (unless (eq bounds 'empty)
+            (setq temp (make-temp-file "exwm-call-process-"))
+            (write-region (nth 0 bounds) (nth 1 bounds) temp nil 'silent))
+          (when delete
+            (exwm--call-process-region-delete start end))
+          (setq infile temp)
+          (exwm--call-process-body program infile destination display args))
+      (when (and temp (file-exists-p temp))
+        (delete-file temp)))))
+
+(defun exwm--call-process (orig program &optional infile destination
+                                display &rest args)
+  "Run `call-process' without stopping the X connection.
+ORIG is the unadvised subr.  PROGRAM, INFILE, DESTINATION, DISPLAY,
+and ARGS are its arguments.  DESTINATION 0 still uses ORIG, because
+that call does not wait.  A fatal Emacs crash cannot be survived
+here: Emacs is the xinit client."
+  (cond
+   ((not (and (stringp program) (exwm--call-process-pump-p)))
+    (apply orig program infile destination display args))
+   (exwm--in-call-process
+    (error "call-process invoked recursively"))
+   ((exwm--call-process-nowait-p destination)
+    (apply orig program infile destination display args))
+   (t
+    (let ((exwm--in-call-process t))
+      (exwm--call-process-body program infile destination display args)))))
+
+(defun exwm--call-process-region (orig start end program &optional delete
+                                       buffer display &rest args)
+  "Run `call-process-region' without stopping the X connection.
+ORIG is the unadvised subr.  START, END, PROGRAM, DELETE, BUFFER,
+DISPLAY, and ARGS are its arguments.  BUFFER 0 still uses ORIG."
+  (cond
+   ((not (and (stringp program) (exwm--call-process-pump-p)))
+    (apply orig start end program delete buffer display args))
+   (exwm--in-call-process
+    (error "call-process invoked recursively"))
+   ((exwm--call-process-nowait-p buffer)
+    (apply orig start end program delete buffer display args))
+   (t
+    (let ((exwm--in-call-process t))
+      (exwm--call-process-region-body
+       start end program delete buffer display args)))))
+
 (defun exwm--disable ()
   "Unregister functions for EXWM to be initialized."
   (exwm--log)
@@ -1205,7 +1634,9 @@ FRAME, if given, indicates the X display EXWM should manage."
   (remove-hook 'after-make-frame-functions #'exwm--init)
   (remove-hook 'kill-emacs-hook #'exwm--server-stop)
   (dolist (i exwm-blocking-subrs)
-    (advice-remove i #'exwm--server-eval-at)))
+    (advice-remove i #'exwm--server-eval-at))
+  (advice-remove 'call-process #'exwm--call-process)
+  (advice-remove 'call-process-region #'exwm--call-process-region))
 
 (defun exwm--enable ()
   "Register functions for EXWM to be initialized."
@@ -1227,7 +1658,13 @@ FRAME, if given, indicates the X display EXWM should manage."
   ;; Manage the subordinate Emacs server.
   (add-hook 'kill-emacs-hook #'exwm--server-stop)
   (dolist (i exwm-blocking-subrs)
-    (advice-add i :around #'exwm--server-eval-at)))
+    (advice-add i :around #'exwm--server-eval-at))
+  ;; Cache before the advice is installed.  The probes call the real
+  ;; `call-process', which would freeze the desktop once we are the
+  ;; window manager.
+  (exwm--cache-signal-descriptions)
+  (advice-add 'call-process :around #'exwm--call-process)
+  (advice-add 'call-process-region :around #'exwm--call-process-region))
 
 (defun exwm--server-stop ()
   "Stop the subordinate Emacs server."
