@@ -126,6 +126,10 @@ With `exwm-floating-border-color-focused' nil, every window uses
            (when exwm--connection
              (xcb:flush exwm--connection)))))
 
+(defcustom exwm-floating-keyboard-step 16
+  "Pixels to move or resize a floating window from the keyboard."
+  :type 'integer)
+
 ;; Cursors for moving/resizing a window
 (defvar exwm-floating--cursor-move nil)
 (defvar exwm-floating--cursor-top-left nil)
@@ -754,6 +758,62 @@ Both DELTA-X and DELTA-Y default to 1.  This command should be bound locally."
                           (+ (pop edges) delta-y)
                           nil nil))
     (xcb:flush exwm--connection)))
+
+(defun exwm-floating--keyboard-delta (n)
+  "Return N steps of `exwm-floating-keyboard-step', in pixels."
+  (* (prefix-numeric-value n) exwm-floating-keyboard-step))
+
+(defun exwm-floating-move-right (&optional n)
+  "Move the floating window right by N steps."
+  (interactive "p")
+  (exwm-floating-move (exwm-floating--keyboard-delta n) 0))
+
+(defun exwm-floating-move-left (&optional n)
+  "Move the floating window left by N steps."
+  (interactive "p")
+  (exwm-floating-move (- (exwm-floating--keyboard-delta n)) 0))
+
+(defun exwm-floating-move-down (&optional n)
+  "Move the floating window down by N steps."
+  (interactive "p")
+  (exwm-floating-move 0 (exwm-floating--keyboard-delta n)))
+
+(defun exwm-floating-move-up (&optional n)
+  "Move the floating window up by N steps."
+  (interactive "p")
+  (exwm-floating-move 0 (- (exwm-floating--keyboard-delta n))))
+
+(defun exwm-floating-resize (delta-width delta-height)
+  "Grow the floating window by DELTA-WIDTH and DELTA-HEIGHT pixels."
+  (unless (and (derived-mode-p 'exwm-mode) exwm--floating-frame)
+    (user-error "[EXWM] `exwm-floating-resize' is only for floating X windows"))
+  (unless (and (= 0 delta-width) (= 0 delta-height))
+    (set-frame-size exwm--floating-frame
+                    (max 1 (+ (frame-pixel-width exwm--floating-frame)
+                              delta-width))
+                    (max 1 (+ (frame-pixel-height exwm--floating-frame)
+                              delta-height))
+                    t)))
+
+(defun exwm-floating-grow-width (&optional n)
+  "Grow the floating window width by N steps."
+  (interactive "p")
+  (exwm-floating-resize (exwm-floating--keyboard-delta n) 0))
+
+(defun exwm-floating-shrink-width (&optional n)
+  "Shrink the floating window width by N steps."
+  (interactive "p")
+  (exwm-floating-resize (- (exwm-floating--keyboard-delta n)) 0))
+
+(defun exwm-floating-grow-height (&optional n)
+  "Grow the floating window height by N steps."
+  (interactive "p")
+  (exwm-floating-resize 0 (exwm-floating--keyboard-delta n)))
+
+(defun exwm-floating-shrink-height (&optional n)
+  "Shrink the floating window height by N steps."
+  (interactive "p")
+  (exwm-floating-resize 0 (- (exwm-floating--keyboard-delta n))))
 
 (defun exwm-floating--init ()
   "Initialize floating module."
