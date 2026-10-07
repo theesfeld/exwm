@@ -47,6 +47,35 @@ That is, when t, Emacs won't intercept keys sent to fullscreen applications."
 (defconst exwm-layout--floating-hidden-position -101
   "Where to place hidden floating X windows.")
 
+(defun exwm-layout--raise-floating ()
+  "Raise the current floating window above other floating windows.
+The client is a sibling of its container, so the container is raised
+and the client is stacked directly above it."
+  (when (and exwm--floating-frame exwm--id)
+    (let ((container (frame-parameter exwm--floating-frame 'exwm-container)))
+      (when container
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:ConfigureWindow
+                           :window container
+                           :value-mask xcb:ConfigWindow:StackMode
+                           :stack-mode xcb:StackMode:Above))
+        (xcb:+request exwm--connection
+            (make-instance 'xcb:ConfigureWindow
+                           :window exwm--id
+                           :value-mask (logior xcb:ConfigWindow:Sibling
+                                               xcb:ConfigWindow:StackMode)
+                           :sibling container
+                           :stack-mode xcb:StackMode:Above))))))
+
+(defun exwm-layout--placeholder-geometry-p (x y width height)
+  "Non-nil when X Y WIDTH HEIGHT is the off-screen min-size floating frame.
+`exwm-floating--set-floating' creates that frame before the real
+geometry exists.  Copying it onto the client leaves a tiny window
+inside a correctly sized container."
+  (and (numberp x) (numberp y) (numberp width) (numberp height)
+       (<= width 160) (<= height 120)
+       (or (< x -1000) (< y -1000) (> x 30000) (> y 30000))))
+
 (defvar exwm-layout--other-buffer-exclude-buffers nil
   "List of buffers that should not be selected by `other-buffer'.")
 
@@ -121,16 +150,42 @@ See variable `exwm-layout-auto-iconify'."
          (width (- (pop edges) x))
          (height (- (pop edges) y)))
     (with-current-buffer (exwm--id->buffer id)
-      (when (and exwm--floating-frame exwm--floating-frame-geometry)
-        (with-slots ((frame-x x) (frame-y y)
-                     (frame-width width) (frame-height height))
-            exwm--floating-frame-geometry
-          (setq exwm--floating-frame-geometry nil
-                x (+ x frame-x (- exwm-layout--floating-hidden-position))
-                y (+ y frame-y (- exwm-layout--floating-hidden-position)))
-          (exwm--set-geometry (frame-parameter exwm--floating-frame
-                                               'exwm-container)
-                              frame-x frame-y frame-width frame-height)))
+      (when exwm--floating-frame
+        (let ((container (frame-parameter exwm--floating-frame 'exwm-container))
+              (inset (frame-parameter exwm--floating-frame 'exwm-floating-inset)))
+          ;; Restore a parked container.  Do not add its origin to the
+          ;; Emacs window edges: those edges are already absolute, and
+          ;; adding the origin again is the 0.35 mis-position
+          ;; (dde5e7a).
+          (when (and container exwm--floating-frame-geometry)
+            (with-slots ((frame-x x) (frame-y y)
+                         (frame-width width) (frame-height height))
+                exwm--floating-frame-geometry
+              (when (and (numberp frame-width) (numberp frame-height)
+                         (> frame-width 1) (> frame-height 1))
+                (exwm--set-geometry container
+                                    frame-x frame-y
+                                    frame-width frame-height))))
+          (setq exwm--floating-frame-geometry nil)
+          ;; Emacs learns the frame position from its own X connection.
+          ;; EXWM moves the frame on the XELB connection, so the cached
+          ;; edges can still describe the initial off-screen frame
+          ;; (about 70x38).  The container geometry is the one EXWM
+          ;; just applied.
+          (when (and container inset)
+            (when-let* ((geometry
+                         (xcb:+request-unchecked+reply
+                             exwm--connection
+                             (make-instance 'xcb:GetGeometry
+                                            :drawable container))))
+              (with-slots ((cx x) (cy y) (cw width) (ch height)
+                           (cborder border-width))
+                  geometry
+                (when (and (> cw 1) (> ch 1))
+                  (setq x (+ cx (or cborder 0) (nth 0 inset))
+                        y (+ cy (or cborder 0) (nth 1 inset))
+                        width (max 1 (- cw (nth 0 inset) (nth 2 inset)))
+                        height (max 1 (- ch (nth 1 inset) (nth 3 inset))))))))))
       (when (exwm-layout--fullscreen-p)
         (with-slots ((x* x)
                      (y* y)
@@ -141,7 +196,8 @@ See variable `exwm-layout-auto-iconify'."
                 y y*
                 width width*
                 height height*)))
-      (exwm--set-geometry id x y width height)
+      (unless (exwm-layout--placeholder-geometry-p x y width height)
+        (exwm--set-geometry id x y width height))
       (xcb:+request exwm--connection (make-instance 'xcb:MapWindow :window id))
       (exwm-layout--set-state id xcb:icccm:WM_STATE:NormalState)
       (setq exwm--ewmh-state
@@ -164,7 +220,12 @@ See variable `exwm-layout-auto-iconify'."
                (geometry (xcb:+request-unchecked+reply exwm--connection
                              (make-instance 'xcb:GetGeometry
                                             :drawable container))))
-          (setq exwm--floating-frame-geometry geometry)
+          ;; A second hide sees the parked 1x1 window.  Keep the
+          ;; geometry saved by the first hide.
+          (when (and geometry
+                     (> (slot-value geometry 'width) 1)
+                     (> (slot-value geometry 'height) 1))
+            (setq exwm--floating-frame-geometry geometry))
           (exwm--set-geometry container exwm-layout--floating-hidden-position
                               exwm-layout--floating-hidden-position
                               1

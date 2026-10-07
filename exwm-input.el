@@ -283,7 +283,26 @@ Current buffer will be the `exwm-mode' buffer when this hook runs.")
 (declare-function exwm-floating--stop-moveresize "exwm-floating.el"
                   (&rest _args))
 (declare-function exwm-layout--iconic-state-p "exwm-layout.el" (&optional id))
+(declare-function exwm-layout--raise-floating "exwm-layout.el" ())
 (declare-function exwm-layout--show "exwm-layout.el" (id &optional window))
+
+(defvar exwm-input--pointer-focus-until nil
+  "Time until which a focus change came from pointer autoselection.
+`mouse-autoselect-window' focuses the window under the pointer.
+That must not raise it.  A click or a command still raises.")
+
+(defun exwm-input--note-pointer-focus (&rest _args)
+  "Remember that pointer autoselection is moving input focus."
+  (setq exwm-input--pointer-focus-until (+ (float-time) 0.2)))
+
+(defun exwm-input--clear-pointer-focus ()
+  "Forget a pointer-autoselection focus once a real command starts."
+  (setq exwm-input--pointer-focus-until nil))
+
+(defun exwm-input--pointer-focus-p ()
+  "Non-nil when the current focus change is from pointer movement."
+  (and exwm-input--pointer-focus-until
+       (< (float-time) exwm-input--pointer-focus-until)))
 (declare-function exwm-reset "exwm.el" ())
 (declare-function exwm-workspace--minibuffer-own-frame-p "exwm-workspace.el")
 (declare-function exwm-workspace--workspace-p "exwm-workspace.el" (workspace))
@@ -463,21 +482,11 @@ attempt later."
                 (exwm--defer 0 #'exwm-workspace-switch exwm--frame))
             (exwm--log "Set focus on #x%x" exwm--id)
             (when exwm--floating-frame
-              ;; Adjust stacking orders of the floating X window.
-              (xcb:+request exwm--connection
-                  (make-instance 'xcb:ConfigureWindow
-                                 :window exwm--id
-                                 :value-mask xcb:ConfigWindow:StackMode
-                                 :stack-mode xcb:StackMode:TopIf))
-              (xcb:+request exwm--connection
-                  (make-instance 'xcb:ConfigureWindow
-                                 :window (frame-parameter exwm--floating-frame
-                                                          'exwm-container)
-                                 :value-mask (logior
-                                              xcb:ConfigWindow:Sibling
-                                              xcb:ConfigWindow:StackMode)
-                                 :sibling exwm--id
-                                 :stack-mode xcb:StackMode:Below))
+              ;; Pointer movement focuses without raising, so a dialog
+              ;; does not bury the one under the mouse.  A command
+              ;; focus still raises.  Clicks raise in the button handler.
+              (unless (exwm-input--pointer-focus-p)
+                (exwm-layout--raise-floating))
               ;; This floating X window might be hide by `exwm-floating-hide'.
               (when (exwm-layout--iconic-state-p)
                 (exwm-layout--show exwm--id window))
@@ -548,8 +557,13 @@ attempt later."
              ;; Resize
              (exwm-floating--start-moveresize event))
             (buffer
-             ;; Click to focus
-             (setq fake-last-command t)
+             ;; Click to focus, and raise.  Pointer entry does not.
+             (setq exwm-input--pointer-focus-until nil
+                   fake-last-command t)
+             (with-current-buffer buffer
+               (when exwm--floating-frame
+                 (exwm-layout--raise-floating)
+                 (xcb:flush exwm--connection)))
              (when-let* ((window (get-buffer-window buffer t))
                          (_(not (eq window (selected-window)))))
                (when-let* ((frame (window-frame window))
@@ -1343,6 +1357,9 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
   (add-hook 'echo-area-clear-hook #'exwm-input--on-echo-area-clear)
   ;; Update focus when buffer list updates
   (add-hook 'buffer-list-update-hook #'exwm-input--on-buffer-list-update)
+  (advice-add 'mouse-autoselect-window-select :before
+              #'exwm-input--note-pointer-focus)
+  (add-hook 'pre-command-hook #'exwm-input--clear-pointer-focus)
 
   (dolist (fun exwm-input--passthrough-functions)
     (advice-add fun :around #'exwm-input--call-with-passthrough)))
@@ -1365,6 +1382,10 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
     (setq exwm-input--echo-area-timer nil))
   (remove-hook 'echo-area-clear-hook #'exwm-input--on-echo-area-clear)
   (remove-hook 'buffer-list-update-hook #'exwm-input--on-buffer-list-update)
+  (advice-remove 'mouse-autoselect-window-select
+                 #'exwm-input--note-pointer-focus)
+  (remove-hook 'pre-command-hook #'exwm-input--clear-pointer-focus)
+  (setq exwm-input--pointer-focus-until nil)
   (when exwm-input--update-focus-timer
     (cancel-timer exwm-input--update-focus-timer))
   ;; Make input focus working even without a WM.
