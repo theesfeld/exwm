@@ -200,6 +200,7 @@ inside a correctly sized container."
 
 (defvar exwm-workspace--current)
 (defvar exwm-workspace--list)
+(defvar exwm-workspace--showing-desktop)
 (declare-function exwm-workspace--set-fullscreen "exwm-workspace.el" (frame))
 (declare-function exwm-workspace--update-workareas "exwm-workspace.el" ())
 (declare-function exwm-input--release-keyboard "exwm-input.el")
@@ -686,8 +687,11 @@ Also recompute workareas when WORKAREAS is non-nil."
   (when exwm--connection
     (exwm-layout-refresh-borders)))
 
-(defun exwm-layout--show (id &optional window)
+(cl-defun exwm-layout--show (id &optional window)
   "Show window ID exactly fit in the Emacs window WINDOW."
+  (when exwm-workspace--showing-desktop
+    (exwm--log "Show #x%x deferred; the desktop is showing" id)
+    (cl-return-from exwm-layout--show))
   (exwm--log "Show #x%x in %s" id window)
   (let* ((edges (exwm--window-inside-absolute-pixel-edges window))
          (x (pop edges))

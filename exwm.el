@@ -624,6 +624,14 @@ DATA contains unmarshalled PropertyNotify event data."
 (defvar exwm-workspace-current-index)
 (defvar exwm-workspace--create-silently)
 
+(defun exwm--on-net-showing-desktop (_id data)
+  "Handle a _NET_SHOWING_DESKTOP client message with DATA.
+DATA's first element is 0 to restore windows and any other value
+to show the desktop.  A request for the current state does nothing."
+  (when (and data (> (length data) 0))
+    (exwm-workspace-toggle-showing-desktop
+     (if (eql (elt data 0) 0) 0 1))))
+
 (defun exwm--on-net-current-desktop (_id data)
   "Handle _NET_CURRENT_DESKTOP message with DATA."
   (let ((index (elt data 0))
@@ -892,7 +900,7 @@ session."
                             xcb:Atom:_NET_SUPPORTING_WM_CHECK
                             ;; xcb:Atom:_NET_VIRTUAL_ROOTS
                             ;; xcb:Atom:_NET_DESKTOP_LAYOUT
-                            ;; xcb:Atom:_NET_SHOWING_DESKTOP
+                            xcb:Atom:_NET_SHOWING_DESKTOP
 
                             ;; Other root window messages.
                             xcb:Atom:_NET_CLOSE_WINDOW
@@ -1122,6 +1130,7 @@ FRAME, if given, indicates the X display EXWM should manage."
          exwm--client-message-functions
          (list (cons xcb:Atom:_NET_NUMBER_OF_DESKTOPS #'exwm--on-net-number-of-desktops)
                (cons xcb:Atom:_NET_CURRENT_DESKTOP #'exwm--on-net-current-desktop)
+               (cons xcb:Atom:_NET_SHOWING_DESKTOP #'exwm--on-net-showing-desktop)
                (cons xcb:Atom:_NET_ACTIVE_WINDOW #'exwm--on-net-active-window)
                (cons xcb:Atom:_NET_CLOSE_WINDOW #'exwm--on-net-close-window)
                (cons xcb:Atom:_NET_REQUEST_FRAME_EXTENTS

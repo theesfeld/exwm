@@ -688,6 +688,8 @@ left where it is, including one whose monitor stays active."
           (exwm-floating--park-emacs-frame frame)))))
     (xcb:flush exwm--connection)))
 
+(defvar exwm-workspace--showing-desktop)
+
 (defun exwm-floating--refresh-emacs-frame (frame)
   "Fit FRAME, or park it when its workspace is hidden.
 `exwm-layout--refresh-floating' calls this.  There is no X
@@ -695,8 +697,9 @@ client to show."
   (when (and (frame-live-p frame)
              (frame-parameter frame 'exwm-floating-emacs))
     (let ((workspace (frame-parameter frame 'exwm-floating-workspace)))
-      (if (and (frame-live-p workspace)
-               (not (exwm-workspace--active-p workspace)))
+      (if (or exwm-workspace--showing-desktop
+              (and (frame-live-p workspace)
+                   (not (exwm-workspace--active-p workspace))))
           (exwm-floating--park-emacs-frame frame)
         (exwm-floating--unpark-emacs-frame frame))
       (when exwm--connection

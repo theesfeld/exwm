@@ -84,7 +84,9 @@ wins for that workspace.
 When there are more monitors than workspaces, workspaces are added
 so each monitor has one.  Unplugging a monitor moves the workspaces
 that named it onto the primary monitor.  The windows stay on those
-workspaces.
+workspaces.  With `exwm-workspace-strip' non-nil, a workspace that
+already names a connected monitor stays there instead of following
+its index.  The plist still wins, and strip order is kept.
 
 Set this to nil to keep every unnamed workspace on the primary
 monitor, which was the behavior before this option existed."
@@ -250,6 +252,11 @@ outputs share an alias and appear once."
                                                    monitor-alias-alist)))
          container-monitor-alist container-frame-alist)
     (when (and primary-monitor monitor-geometry-alist)
+      (let ((old-monitors
+             (mapcar (lambda (frame)
+                       (cons frame
+                             (frame-parameter frame 'exwm-randr-monitor)))
+                     exwm-workspace--list)))
       (when (and exwm-randr-auto-assign
                  (not exwm-randr--adding)
                  (> (length order) (exwm-workspace--count)))
@@ -261,13 +268,24 @@ outputs share an alias and appear once."
         (setq exwm-workspace--fullscreen-frame-count 0))
       (dotimes (i (exwm-workspace--count))
         (let* ((configured (plist-get exwm-randr-workspace-monitor-plist i))
+               (frame (elt exwm-workspace--list i))
+               (existing (frame-parameter frame 'exwm-randr-monitor))
+               ;; A frame this refresh just created is not in
+               ;; old-monitors, so auto-assign can place it.  One that
+               ;; was already here keeps its monitor.
+               (kept (and exwm-workspace-strip
+                          (not configured)
+                          (assq frame old-monitors)
+                          (stringp existing)
+                          (assoc existing monitor-geometry-alist)
+                          existing))
                (monitor (or configured
+                            kept
                             (and exwm-randr-auto-assign
                                  (if (< i (length order))
                                      (nth i order)
                                    primary-monitor))))
                (geometry (cdr (assoc monitor monitor-geometry-alist)))
-               (frame (elt exwm-workspace--list i))
                (container (frame-parameter frame 'exwm-container)))
           (if geometry
               ;; Unify monitor names in case it's a mirroring setup.
@@ -312,7 +330,17 @@ outputs share an alias and appear once."
             (exwm-workspace--set-active (cdr (assq xwin container-frame-alist))
                                         t))))
       (xcb:flush exwm-randr--connection)
-      (run-hooks 'exwm-randr-refresh-hook))))
+      (when exwm-workspace-strip
+        (exwm-workspace--strip-note-orders
+         (exwm-workspace--strip-rebuild
+          (mapcar (lambda (frame)
+                    (list frame
+                          (frame-parameter frame 'exwm-randr-monitor)
+                          (cdr (assq frame old-monitors))
+                          (frame-parameter frame
+                                           'exwm-workspace-strip-order)))
+                  exwm-workspace--list))))
+      (run-hooks 'exwm-randr-refresh-hook)))))
 
 (defun exwm-randr--on-ScreenChangeNotify (data _synthetic)
   "Handle `ScreenChangeNotify' event with DATA.
