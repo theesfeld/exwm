@@ -92,6 +92,7 @@ nil: Disable timestamp."
 (declare-function exwm-input-release-keyboard "exwm-input.el")
 (declare-function exwm-input-send-next-key "exwm-input.el" (times))
 (declare-function exwm-layout-set-fullscreen "exwm-layout.el" (&optional id))
+(declare-function exwm-run-or-raise "exwm.el" (program &optional class))
 (declare-function exwm-layout-toggle-mode-line "exwm-layout.el")
 (declare-function exwm-manage--kill-buffer-query-function "exwm-manage.el")
 (declare-function exwm-workspace-move-window "exwm-workspace.el"
@@ -352,6 +353,7 @@ One of `line-mode' or `char-mode'.")
   "Menu for `exwm-mode'."
   `("EXWM"
     ("General"
+     ["Run or raise" exwm-run-or-raise]
      ["Toggle floating" exwm-floating-toggle-floating]
      ["Toggle fullscreen mode" exwm-layout-toggle-fullscreen]
      ["Hide window" exwm-floating-hide exwm--floating-frame]
