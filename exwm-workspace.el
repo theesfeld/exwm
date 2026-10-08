@@ -98,6 +98,10 @@ opens, nil when it closes."
 Put this in `mode-line-format' or `global-mode-string', or set
 `exwm-workspace-show-mode-line'.")
 
+;; `:eval' in a mode-line variable is ignored unless the variable is
+;; risky.  The indicator would otherwise be blank.
+(put 'exwm-workspace-mode-line 'risky-local-variable t)
+
 (defcustom exwm-workspace-number 1
   "Initial number of workspaces."
   :type 'integer)
@@ -1772,11 +1776,18 @@ restores both."
           (call-interactively binding))))))
 
 (defun exwm-workspace--set-mode-line (symbol value)
-  "Set SYMBOL to VALUE and install or remove the mode-line indicator."
+  "Set SYMBOL to VALUE and install or remove the mode-line indicator.
+A mode-line list whose first element is a symbol is a conditional.
+`global-mode-string' therefore starts with an empty string, so the
+indicator is shown instead of \"*invalid*\"."
   (set-default symbol value)
-  (unless (listp global-mode-string)
-    (setq global-mode-string (list global-mode-string)))
-  (setq global-mode-string (delq 'exwm-workspace-mode-line global-mode-string))
+  (unless (consp global-mode-string)
+    (setq global-mode-string (list "" global-mode-string)))
+  (unless (or (stringp (car global-mode-string))
+              (consp (car global-mode-string)))
+    (setq global-mode-string (cons "" global-mode-string)))
+  (setq global-mode-string
+        (delq nil (delq 'exwm-workspace-mode-line global-mode-string)))
   (when value
     (setq global-mode-string
           (append global-mode-string '(exwm-workspace-mode-line))))
