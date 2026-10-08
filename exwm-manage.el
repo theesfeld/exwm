@@ -214,10 +214,7 @@ current.")
 (declare-function exwm-input-grab-keyboard "exwm-input.el" (&optional id))
 (declare-function exwm-input-release-keyboard "exwm-input.el" (&optional id))
 (declare-function exwm-input-set-local-simulation-keys "exwm-input.el")
-(declare-function exwm-layout--chrome-wanted-p "exwm-layout.el" ())
 (declare-function exwm-layout--fullscreen-p "exwm-layout.el" ())
-(declare-function exwm-layout--tiled-chrome "exwm-layout.el"
-                  (x y width height))
 (declare-function exwm-layout--iconic-state-p "exwm-layout.el" (&optional id))
 (declare-function exwm-layout-set-fullscreen "exwm-layout.el" (&optional id))
 (declare-function exwm-workspace--get-geometry "exwm-workspace.el" (frame))
@@ -1061,10 +1058,8 @@ FRAME is the frame to be deleted."
           (delq (string-to-number (frame-parameter frame 'outer-window-id))
                 exwm-manage--frame-outer-id-list))))
 
-(defun exwm-manage--send-ConfigureNotify (window x y width height
-                                                 &optional border)
-  "Send a ConfigureNotify event to WINDOW with X Y WIDTH and HEIGHT.
-BORDER is the border width EXWM applied.  It defaults to 0."
+(defun exwm-manage--send-ConfigureNotify (window x y width height)
+  "Send a ConfigureNotify event to WINDOW with X Y WIDTH and HEIGHT."
   (exwm--log "Reply with ConfigureNotify: %dx%d+%d+%d" width height x y)
   (xcb:+request exwm--connection
       (make-instance 'xcb:SendEvent
@@ -1078,8 +1073,7 @@ BORDER is the border width EXWM applied.  It defaults to 0."
                               :x x :y y
                               :width width
                               :height height
-                              :border-width (or border 0)
-                              :override-redirect 0)
+                              :border-width 0 :override-redirect 0)
                              exwm--connection))))
 
 (defun exwm-manage--on-ConfigureRequest (data _synthetic)
@@ -1109,16 +1103,9 @@ border-width: %d; sibling: #x%x; stack-mode: %d"
                    (window-height (- (elt edges 3) window-y)))
               (if (not exwm--floating-frame)
                   ;; If the window isn't floating, fit it to its Emacs window.
-                  (if (exwm-layout--chrome-wanted-p)
-                      (pcase-let ((`(,cx ,cy ,cw ,ch ,border)
-                                   (exwm-layout--tiled-chrome
-                                    window-x window-y
-                                    window-width window-height)))
-                        (exwm-manage--send-ConfigureNotify
-                         window cx cy cw ch border))
-                    (exwm-manage--send-ConfigureNotify
-                     window window-x window-y
-                     window-width window-height))
+                  (exwm-manage--send-ConfigureNotify
+                   window window-x window-y
+                   window-width window-height)
                 ;; Finally, resize the floating window.
                 (exwm--log "ConfigureWindow (resize floating X window)")
                 (let* ((frame-id (frame-parameter exwm--floating-frame

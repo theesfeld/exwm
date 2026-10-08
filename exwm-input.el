@@ -286,9 +286,7 @@ Current buffer will be the `exwm-mode' buffer when this hook runs.")
 
 (defvar exwm-workspace--current)
 (defvar exwm-floating-border-color-focused)
-(defvar exwm-layout-border-width)
 (declare-function exwm-floating-refresh-borders "exwm-floating.el" ())
-(declare-function exwm-layout-refresh-borders "exwm-layout.el" ())
 (declare-function exwm-floating--raise-emacs-frame "exwm-floating.el" (frame))
 (declare-function exwm-floating--do-moveresize "exwm-floating.el"
                   (data _synthetic))
@@ -653,9 +651,6 @@ attempt later."
             (xcb:flush exwm--connection)))))
     (when exwm-floating-border-color-focused
       (exwm-floating-refresh-borders))
-    (when (and (natnump exwm-layout-border-width)
-               (> exwm-layout-border-width 0))
-      (exwm-layout-refresh-borders))
     (let ((warp (exwm-input--should-warp-p window)))
       ;; Consume a pointer-chosen window so the next command can warp.
       (setq exwm-input--pointer-focus-window nil)
