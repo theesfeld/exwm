@@ -768,8 +768,13 @@ When FORCE is true, allow switching to current workspace."
                 (exwm-layout--hide exwm--id)
               (when (eq frame exwm--frame)
                 (let ((window (get-buffer-window nil t)))
+                  ;; A tiled client is iconic merely because this
+                  ;; workspace was hidden.  Map it.  A floating client
+                  ;; hidden with `exwm-floating-hide' stays hidden
+                  ;; until it is selected.
                   (when (and window
-                             (not (exwm-layout--iconic-state-p)))
+                             (or (not exwm--floating-frame)
+                                 (not (exwm-layout--iconic-state-p))))
                     (exwm-layout--show exwm--id window))))))))
       ;; A fullscreen client was mapped before its siblings.  Raise it
       ;; after them, then raise child frames again so a popup stays

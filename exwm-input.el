@@ -603,15 +603,17 @@ attempt later."
                 (set-frame-parameter exwm--frame 'exwm-selected-window window)
                 (exwm--defer 0 #'exwm-workspace-switch exwm--frame))
             (exwm--log "Set focus on #x%x" exwm--id)
+            ;; Selecting a hidden client maps it.  Tiled clients become
+            ;; iconic when another buffer covers them; the floating
+            ;; path was the only one that mapped them again.
+            (when (exwm-layout--iconic-state-p)
+              (exwm-layout--show exwm--id window))
             (when exwm--floating-frame
               ;; Pointer movement focuses without raising, so a dialog
               ;; does not bury the one under the mouse.  A command
               ;; focus still raises.  Clicks raise in the button handler.
               (unless (exwm-input--pointer-focus-p)
                 (exwm-layout--raise-floating))
-              ;; This floating X window might be hide by `exwm-floating-hide'.
-              (when (exwm-layout--iconic-state-p)
-                (exwm-layout--show exwm--id window))
               (xcb:flush exwm--connection))
             (exwm-input--set-focus exwm--id))
         (when (eq (selected-window) window)
