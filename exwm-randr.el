@@ -29,9 +29,11 @@
 ;; To use this module, load and enable it.  Workspaces are placed on
 ;; active monitors with no plist: the primary monitor first, then the
 ;; others from left to right and top to bottom.  A monitor that is
-;; plugged in receives a workspace when there are fewer workspaces than
-;; monitors.  `exwm-randr-workspace-monitor-plist' still overrides that
-;; for the indexes it names.  `exwm-randr-screen-change-hook' is where a
+;; plugged in receives a workspace: a new one if every workspace already
+;; sits alone on a monitor, otherwise one of the extras.  Unplugging
+;; remembers the monitor so replugging restores that workspace.
+;; `exwm-randr-workspace-monitor-plist' still overrides that for the
+;; indexes it names.  `exwm-randr-screen-change-hook' is where a
 ;; user script configures outputs with xrandr(1), for example:
 ;;
 ;;   (setq exwm-randr-workspace-monitor-plist '(0 "VGA1"))
@@ -83,10 +85,13 @@ wins for that workspace.
 
 When there are more monitors than workspaces, workspaces are added
 so each monitor has one.  Unplugging a monitor moves the workspaces
-that named it onto the primary monitor.  The windows stay on those
-workspaces.  With `exwm-workspace-strip' non-nil, a workspace that
-already names a connected monitor stays there instead of following
-its index.  The plist still wins, and strip order is kept.
+that named it onto the primary monitor, remembering that monitor so
+replugging restores them.  A still-empty monitor takes a workspace
+that is stacked on another, or a new workspace.  The windows stay
+on those workspaces.  With `exwm-workspace-strip' non-nil, a
+workspace that already names a connected monitor stays there instead
+of following its index, unless it is the extra copy used to fill an
+empty monitor.  The plist still wins, and strip order is kept.
 
 Set this to nil to keep every unnamed workspace on the primary
 monitor, which was the behavior before this option existed."
@@ -237,6 +242,74 @@ outputs share an alias and appear once."
         (cons hit (delq hit unique))
       unique)))
 
+(defun exwm-randr--choose-monitors (primary order geometry-alist old-monitors)
+  "Return a monitor name for each workspace.
+PRIMARY is first in ORDER.  A plist entry wins.  A workspace that
+was moved off a monitor that has come back is restored there.
+`exwm-workspace-strip' keeps a workspace on a still-connected
+monitor.  Every name in ORDER is used at least once: a duplicate
+workspace is moved onto an empty monitor, or a workspace is added."
+  (let* ((n (exwm-workspace--count))
+         (chosen (make-vector n nil))
+         (count (make-hash-table :test #'equal)))
+    (dotimes (i n)
+      (let* ((frame (elt exwm-workspace--list i))
+             (configured (plist-get exwm-randr-workspace-monitor-plist i))
+             (existing (frame-parameter frame 'exwm-randr-monitor))
+             (last (frame-parameter frame 'exwm-randr-last-monitor))
+             (monitor
+              (cond
+               ((and configured (assoc configured geometry-alist))
+                configured)
+               ((and last
+                     (assoc last geometry-alist)
+                     (zerop (gethash last count 0)))
+                last)
+               ((and exwm-workspace-strip
+                     (assq frame old-monitors)
+                     (stringp existing)
+                     (assoc existing geometry-alist))
+                existing))))
+        (aset chosen i monitor)
+        (when monitor
+          (puthash monitor (1+ (gethash monitor count 0)) count))))
+    (dotimes (i n)
+      (unless (aref chosen i)
+        (let ((monitor nil))
+          (dolist (name order)
+            (when (and (not monitor) (zerop (gethash name count 0)))
+              (setq monitor name)))
+          (setq monitor (or monitor
+                            (and exwm-randr-auto-assign
+                                 (if (< i (length order))
+                                     (nth i order)
+                                   primary))
+                            primary))
+          (aset chosen i monitor)
+          (puthash monitor (1+ (gethash monitor count 0)) count))))
+    (when exwm-randr-auto-assign
+      (dolist (name order)
+        (when (zerop (gethash name count 0))
+          (let ((donor nil))
+            (dotimes (i n)
+              (let ((current (aref chosen i)))
+                (when (and (not (plist-get exwm-randr-workspace-monitor-plist i))
+                           current
+                           (> (gethash current count 0) 1))
+                  (setq donor i))))
+            (if donor
+                (let ((old (aref chosen donor)))
+                  (puthash old (1- (gethash old count)) count)
+                  (aset chosen donor name)
+                  (puthash name 1 count))
+              (unless exwm-randr--adding
+                (let ((exwm-randr--adding t))
+                  (exwm-workspace-add)
+                  (setq chosen (vconcat chosen (vector name))
+                        n (1+ n))
+                  (puthash name 1 count))))))))
+    (append chosen nil)))
+
 (defun exwm-randr-refresh ()
   "Refresh workspaces according to the updated RandR info."
   (interactive)
@@ -256,44 +329,35 @@ outputs share an alias and appear once."
              (mapcar (lambda (frame)
                        (cons frame
                              (frame-parameter frame 'exwm-randr-monitor)))
-                     exwm-workspace--list)))
-      (when (and exwm-randr-auto-assign
-                 (not exwm-randr--adding)
-                 (> (length order) (exwm-workspace--count)))
-        (let ((exwm-randr--adding t))
-          (while (> (length order) (exwm-workspace--count))
-            (exwm-workspace-add))))
+                     exwm-workspace--list))
+            (chosen nil))
+      (setq chosen
+            (exwm-randr--choose-monitors primary-monitor order
+                                         monitor-geometry-alist
+                                         old-monitors))
       (when exwm-workspace--fullscreen-frame-count
         ;; Not all workspaces are fullscreen; reset this counter.
         (setq exwm-workspace--fullscreen-frame-count 0))
       (dotimes (i (exwm-workspace--count))
-        (let* ((configured (plist-get exwm-randr-workspace-monitor-plist i))
-               (frame (elt exwm-workspace--list i))
+        (let* ((frame (elt exwm-workspace--list i))
                (existing (frame-parameter frame 'exwm-randr-monitor))
-               ;; A frame this refresh just created is not in
-               ;; old-monitors, so auto-assign can place it.  One that
-               ;; was already here keeps its monitor.
-               (kept (and exwm-workspace-strip
-                          (not configured)
-                          (assq frame old-monitors)
-                          (stringp existing)
-                          (assoc existing monitor-geometry-alist)
-                          existing))
-               (monitor (or configured
-                            kept
-                            (and exwm-randr-auto-assign
-                                 (if (< i (length order))
-                                     (nth i order)
-                                   primary-monitor))))
+               (monitor (or (nth i chosen) primary-monitor))
                (geometry (cdr (assoc monitor monitor-geometry-alist)))
                (container (frame-parameter frame 'exwm-container)))
           (if geometry
               ;; Unify monitor names in case it's a mirroring setup.
               (setq monitor (cdr (assoc monitor monitor-alias-alist)))
             ;; Missing monitors fallback to the primary one.
+            (when (and (stringp existing)
+                       (not (equal existing primary-monitor)))
+              (set-frame-parameter frame 'exwm-randr-last-monitor existing))
             (setq monitor primary-monitor
                   geometry (cdr (assoc primary-monitor
                                        monitor-geometry-alist))))
+          (when (and (stringp monitor)
+                     (equal monitor
+                            (frame-parameter frame 'exwm-randr-last-monitor)))
+            (set-frame-parameter frame 'exwm-randr-last-monitor nil))
           (setq container-monitor-alist (nconc
                                          `((,container . ,(intern monitor)))
                                          container-monitor-alist)
