@@ -511,9 +511,12 @@ If FRAME is nil, refresh layout of selected frame."
               (let ((window (car windows)))
                 (if (eq frame exwm--frame)
                     ;; Show it if `frame' is active, hide otherwise.
-                    ;; An iconic client stays hidden until it is selected.
-                    (if (and (exwm-workspace--active-p frame)
-                             (not (exwm-layout--iconic-state-p)))
+                    ;; Hiding a covered buffer also sets IconicState.
+                    ;; A buffer that is on screen must be mapped again;
+                    ;; leaving it iconic paints a black window.  A
+                    ;; minimized client has no window here, so it stays
+                    ;; hidden.
+                    (if (exwm-workspace--active-p frame)
                         (exwm-layout--show exwm--id window)
                       (exwm-layout--hide exwm--id))
                   ;; It was last shown in other workspace; move it here.
