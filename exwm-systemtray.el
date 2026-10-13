@@ -280,13 +280,20 @@ The returned geometry will be scaled to fit the systemtray."
         (setq x (+ x (slot-value (cdr pair) 'width)
                    exwm-systemtray-icon-gap))
         (setq map t)))
-    (let ((workarea (exwm-workspace--workarea exwm-workspace-current-index)))
+    (let* ((frame (exwm-systemtray--embedder-frame))
+           (size (exwm-systemtray--frame-size frame))
+           (window-width (car size))
+           (y (and frame (exwm-systemtray--y-position frame))))
       (xcb:+request exwm-systemtray--connection
           (make-instance 'xcb:ConfigureWindow
                          :window exwm-systemtray--embedder-window
                          :value-mask (logior xcb:ConfigWindow:X
-                                             xcb:ConfigWindow:Width)
-                         :x (- (slot-value workarea 'width) x)
+                                             xcb:ConfigWindow:Width
+                                             (if y xcb:ConfigWindow:Y 0))
+                         :x (if window-width
+                                (exwm-systemtray--x-for-width window-width x)
+                              0)
+                         :y (or y 0)
                          :width x)))
     (setq exwm-systemtray-width x)
     (when map
@@ -407,18 +414,95 @@ monitor, or the first frame there, or else CURRENT."
         current))
    (t current)))
 
+(defun exwm-systemtray--visible-frame (chosen frames)
+  "Return a frame that is on screen for CHOSEN.
+FRAMES is a list of (FRAME MONITOR ACTIVE) in workspace order.
+CHOSEN is used when it is active, or when no workspace is.
+Otherwise the active frame on CHOSEN's monitor is used, then any
+active frame.  An inactive workspace is a 1x1 container, and the
+tray clipped inside it is missing."
+  (let ((row (and chosen (cl-find chosen frames :key #'car))))
+    (or (and row (nth 2 row) chosen)
+        (and row
+             (car (cl-find-if (lambda (other)
+                                (and (nth 2 other)
+                                     (equal (nth 1 other) (nth 1 row))))
+                              frames)))
+        (car (cl-find-if (lambda (other) (nth 2 other)) frames))
+        chosen)))
+
 (defun exwm-systemtray--embedder-frame ()
   "Return the frame that currently parents the system tray."
   (if (exwm-workspace--minibuffer-own-frame-p)
       exwm-workspace--minibuffer
-    (exwm-systemtray--choose-frame
-     exwm-systemtray-workspace
-     (mapcar (lambda (frame)
-               (list frame
-                     (frame-parameter frame 'exwm-randr-monitor)
-                     (exwm-workspace--active-p frame)))
-             exwm-workspace--list)
-     exwm-workspace--current)))
+    (let ((frames (mapcar (lambda (frame)
+                            (list frame
+                                  (frame-parameter frame 'exwm-randr-monitor)
+                                  (exwm-workspace--active-p frame)))
+                          exwm-workspace--list)))
+      (exwm-systemtray--visible-frame
+       (exwm-systemtray--choose-frame
+        exwm-systemtray-workspace
+        frames
+        exwm-workspace--current)
+       frames))))
+
+(defun exwm-systemtray--frame-size (frame)
+  "Return (WIDTH HEIGHT) of the window that parents the tray on FRAME.
+The workarea is the size EXWM assigns.  `frame-pixel-height' is
+updated later, after that assignment, so a monitor change would
+leave the tray at the previous edge.  Workspace 0 is a valid
+index.  A missing workarea falls back to the Emacs frame size."
+  (let ((index (and (framep frame)
+                    (fboundp 'exwm-workspace--position)
+                    (exwm-workspace--position frame)))
+        workarea)
+    (when (integerp index)
+      (setq workarea (ignore-errors (exwm-workspace--workarea frame))))
+    (if (and workarea
+             (wholenump (slot-value workarea 'width))
+             (wholenump (slot-value workarea 'height))
+             (> (slot-value workarea 'width) 1)
+             (> (slot-value workarea 'height) 1))
+        (list (slot-value workarea 'width)
+              (slot-value workarea 'height))
+      (when (and (framep frame) (frame-live-p frame))
+        (list (frame-pixel-width frame)
+              (frame-pixel-height frame))))))
+
+(defun exwm-systemtray--y-for-height (height position tray-height)
+  "Y of a tray TRAY-HEIGHT pixels tall in a window HEIGHT pixels tall.
+POSITION is `exwm-systemtray-position'."
+  (cond
+   ((or (eq position 'bottom) (and (fixnump position) (<= position 0)))
+    (- height
+       tray-height
+       (if (fixnump position) (- position) 0)))
+   ((fixnump position) position)
+   (t 0)))
+
+(defun exwm-systemtray--x-for-width (width tray-width)
+  "X that right-aligns a tray TRAY-WIDTH pixels wide in WIDTH."
+  (- width tray-width))
+
+(defvar exwm-systemtray--relayout-timer nil
+  "Timer that repositions the tray after a monitor change.")
+
+(defun exwm-systemtray--relayout (&optional _frame)
+  "Put the tray on the visible workspace at its current size."
+  (setq exwm-systemtray--relayout-timer nil)
+  (when (and exwm-systemtray--connection
+             exwm-systemtray--embedder-window)
+    (exwm-systemtray--on-workspace-switch)))
+
+(defun exwm-systemtray--schedule-relayout (&optional _frame)
+  "Reposition the tray after pending frame resizes.
+RandR writes the new workarea before the frame window finishes
+changing size.  A second pass then keeps the tray on the edge of
+the monitor that is still connected."
+  (unless (timerp exwm-systemtray--relayout-timer)
+    (setq exwm-systemtray--relayout-timer
+          (run-at-time 0 nil #'exwm-systemtray--relayout))))
 
 (defun exwm-systemtray--set-workspace (symbol value)
   "Set SYMBOL to VALUE and move the tray if it is running."
@@ -531,20 +615,17 @@ Argument DATA contains the raw event data."
 
 (defun exwm-systemtray--y-position (&optional frame)
   "Y position of the system tray on FRAME.
-FRAME defaults to the frame that parents the tray."
-  (let ((pos exwm-systemtray-position)
-        (frame (or frame (exwm-systemtray--embedder-frame)
-                   exwm-workspace--current)))
-    (cond
-     ((or (eq pos 'bottom) (and (fixnump pos) (<= pos 0)))
-      ;; On GTK, pixel-height != outer-height. The frame-pixel-height is the height of the inner
-      ;; frame window (corresponding to window-id) while the frame-outer-height corresponds to the
-      ;; frame itself (outer-id). We embed relative to "window-id", so we need the pixel-height.
-      (- (frame-pixel-height frame)
-         exwm-systemtray-height
-         (if (fixnump pos) (- pos) 0)))
-     ((fixnump pos) pos)
-     (t 0))))
+FRAME defaults to the frame that parents the tray.  The workarea
+height is used, because `frame-pixel-height' still describes the
+previous monitor while RandR refresh is running."
+  (let* ((pos exwm-systemtray-position)
+         (frame (or frame (exwm-systemtray--embedder-frame)
+                    exwm-workspace--current))
+         (height (cadr (exwm-systemtray--frame-size frame))))
+    (if (and (numberp height) (> height 0))
+        (exwm-systemtray--y-for-height height pos
+                                       (or exwm-systemtray-height 0))
+      0)))
 
 (defun exwm-systemtray--on-workspace-switch ()
   "Reparent and refresh the system tray after a workspace change.
@@ -571,17 +652,10 @@ A separate minibuffer frame keeps the parent it was given."
   (exwm-systemtray--refresh-background-color 'remap))
 
 (defun exwm-systemtray--refresh-all ()
-  "Reposition/Refresh the system tray."
+  "Reposition and refresh the system tray."
   (exwm--log)
-  (unless (exwm-workspace--minibuffer-own-frame-p)
-    (let ((frame (exwm-systemtray--embedder-frame)))
-      (when (and frame (frame-live-p frame))
-        (xcb:+request exwm-systemtray--connection
-            (make-instance 'xcb:ConfigureWindow
-                           :window exwm-systemtray--embedder-window
-                           :value-mask xcb:ConfigWindow:Y
-                           :y (exwm-systemtray--y-position frame))))))
-  (exwm-systemtray--refresh))
+  (exwm-systemtray--on-workspace-switch)
+  (exwm-systemtray--schedule-relayout))
 
 (cl-defun exwm-systemtray--init ()
   "Initialize system tray module."
@@ -746,7 +820,8 @@ A separate minibuffer frame keeps the parent it was given."
   (add-hook 'menu-bar-mode-hook #'exwm-systemtray--refresh-all)
   (add-hook 'tool-bar-mode-hook #'exwm-systemtray--refresh-all)
   (when (boundp 'exwm-randr-refresh-hook)
-    (add-hook 'exwm-randr-refresh-hook #'exwm-systemtray--on-workspace-switch))
+    (add-hook 'exwm-randr-refresh-hook #'exwm-systemtray--on-workspace-switch)
+    (add-hook 'exwm-randr-refresh-hook #'exwm-systemtray--schedule-relayout))
   ;; The struts can be updated already.
   (when exwm-workspace--workareas
     (exwm-systemtray--refresh-all)))
@@ -782,9 +857,14 @@ A separate minibuffer frame keeps the parent it was given."
     (remove-hook 'disable-theme-functions #'exwm-systemtray--on-theme-change)
     (remove-hook 'menu-bar-mode-hook #'exwm-systemtray--refresh-all)
     (remove-hook 'tool-bar-mode-hook #'exwm-systemtray--refresh-all)
+    (when (timerp exwm-systemtray--relayout-timer)
+      (cancel-timer exwm-systemtray--relayout-timer)
+      (setq exwm-systemtray--relayout-timer nil))
     (when (boundp 'exwm-randr-refresh-hook)
       (remove-hook 'exwm-randr-refresh-hook
-                   #'exwm-systemtray--on-workspace-switch))))
+                   #'exwm-systemtray--on-workspace-switch)
+      (remove-hook 'exwm-randr-refresh-hook
+                   #'exwm-systemtray--schedule-relayout))))
 
 (provide 'exwm-systemtray)
 ;;; exwm-systemtray.el ends here
