@@ -424,52 +424,342 @@ ARGS are additional arguments to CALLBACK."
 
 (defvar exwm-input--last-enter-notify-position nil)
 
+(defvar exwm-input--enter-timer nil
+  "Timer that selects the window under the pointer.")
+
+(defvar exwm-input--enter-window nil
+  "Window the pointer entered.")
+
+(defvar exwm-input--enter-position nil
+  "Root position recorded when the pointer entered, as (X . Y).")
+
+(defun exwm-input--root-in-edges-p (x y edges)
+  "Return non-nil when root position X Y lies in EDGES.
+EDGES is (LEFT TOP RIGHT BOTTOM).  The right and bottom edges
+belong to the next window."
+  (and (numberp x) (numberp y) (listp edges)
+       (>= x (nth 0 edges)) (>= y (nth 1 edges))
+       (< x (nth 2 edges)) (< y (nth 3 edges))))
+
+(defun exwm-input--enter-action (autoselect in-window moved
+                                             minibuffer-active
+                                             target-minibuffer)
+  "Decide what pointer entry should do.
+AUTOSELECT is `mouse-autoselect-window'.  IN-WINDOW is non-nil
+when the pointer is still over the target.  MOVED is non-nil
+when it has moved since it entered.  MINIBUFFER-ACTIVE is non-nil
+when the minibuffer has focus.  TARGET-MINIBUFFER is non-nil when
+the target is the minibuffer.
+Return `select', `wait', or nil.  A negative AUTOSELECT waits
+until the pointer stops.  An active minibuffer keeps focus."
+  (cond
+   ((or (null autoselect)
+        (not in-window)
+        minibuffer-active
+        (and target-minibuffer (not minibuffer-active)))
+    nil)
+   ((and (numberp autoselect) (< autoselect 0) moved)
+    'wait)
+   (t 'select)))
+
+(defun exwm-input--enter-delay (autoselect)
+  "Seconds to wait before pointer entry selects a window."
+  (if (numberp autoselect) (abs autoselect) 0))
+
+(defun exwm-input--window-workspace (window)
+  "Workspace frame that shows WINDOW."
+  (let ((frame (window-frame window)))
+    (cond
+     ((exwm-workspace--workspace-p frame) frame)
+     ((frame-parameter frame 'exwm-floating-workspace))
+     (t frame))))
+
+(defun exwm-input--window-for-client (buffer root-x root-y)
+  "Return the window of BUFFER that contains root position ROOT-X ROOT-Y.
+When the pointer is between two windows showing BUFFER, the one
+that contains the position wins.  Otherwise the first shown
+window is used."
+  (when (buffer-live-p buffer)
+    (let (found)
+      (dolist (window (get-buffer-window-list buffer nil t))
+        (when (exwm-input--root-in-edges-p
+               root-x root-y (window-absolute-pixel-edges window))
+          (setq found window)))
+      (or found (get-buffer-window buffer t)))))
+
+(defun exwm-input--pointer-root-position ()
+  "Return the pointer's root position as (X . Y), or nil."
+  (when (and exwm--connection
+             (slot-value exwm--connection 'connected))
+    (let ((reply (xcb:+request-unchecked+reply exwm--connection
+                     (make-instance 'xcb:QueryPointer
+                                    :window exwm--root))))
+      (and reply
+           (cons (slot-value reply 'root-x)
+                 (slot-value reply 'root-y))))))
+
+(defun exwm-input--x-buffer-p (buffer)
+  "Return non-nil when BUFFER is a live X client."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer (derived-mode-p 'exwm-mode))))
+
+(defun exwm-input--pointer-in-client-p (id)
+  "Return non-nil when the pointer is inside managed X window ID.
+Uses the client's own geometry so this works when the client is a
+sibling of the Emacs frame, which `mouse-position' cannot see."
+  (when (and exwm--connection (integerp id)
+             (slot-value exwm--connection 'connected))
+    (let ((reply (xcb:+request-unchecked+reply exwm--connection
+                     (make-instance 'xcb:QueryPointer :window id)))
+          (geom (xcb:+request-unchecked+reply exwm--connection
+                    (make-instance 'xcb:GetGeometry :drawable id))))
+      (and reply geom (slot-value reply 'same-screen)
+           (let ((x (slot-value reply 'win-x))
+                 (y (slot-value reply 'win-y)))
+             (and (>= x 0) (>= y 0)
+                  (< x (slot-value geom 'width))
+                  (< y (slot-value geom 'height))))))))
+
+(defun exwm-input--pointer-over-window-p (window)
+  "Return non-nil when the pointer is still over WINDOW.
+An X client is tested with QueryPointer on the client.  An Emacs
+window uses root coordinates against the window edges."
+  (when (window-live-p window)
+    (let ((buffer (window-buffer window)))
+      (if (exwm-input--x-buffer-p buffer)
+          (exwm-input--pointer-in-client-p
+           (buffer-local-value 'exwm--id buffer))
+        (let ((pos (exwm-input--pointer-root-position)))
+          (and pos (exwm-input--root-in-edges-p
+                    (car pos) (cdr pos)
+                    (window-absolute-pixel-edges window))))))))
+
+(defun exwm-input--managed-id-from (id)
+  "Return the managed X window at or under ID, or nil.
+Tiled clients sit on the root as siblings of the Emacs frame.
+A container is walked one child deep."
+  (cond
+   ((not (and (integerp id) (/= id 0)))
+    nil)
+   ((exwm--id->buffer id)
+    id)
+   (t
+    (let ((reply (xcb:+request-unchecked+reply exwm--connection
+                     (make-instance 'xcb:QueryPointer :window id))))
+      (and reply
+           (let ((child (slot-value reply 'child)))
+             (and (integerp child) (/= child 0) (exwm--id->buffer child)
+                  child)))))))
+
+(defun exwm-input--managed-id-at-pointer ()
+  "Managed X window under the pointer, or nil when over Emacs."
+  (when (and exwm--connection
+             (slot-value exwm--connection 'connected))
+    (let ((reply (xcb:+request-unchecked+reply exwm--connection
+                     (make-instance 'xcb:QueryPointer :window exwm--root))))
+      (and reply (slot-value reply 'same-screen)
+           (exwm-input--managed-id-from (slot-value reply 'child))))))
+
+(defun exwm-input--x-window-at-pointer ()
+  "Emacs window showing the X client under the pointer, or nil."
+  (let* ((id (exwm-input--managed-id-at-pointer))
+         (buffer (and id (exwm--id->buffer id)))
+         (pos (exwm-input--pointer-root-position)))
+    (and buffer pos
+         (exwm-input--window-for-client buffer (car pos) (cdr pos)))))
+
+(defun exwm-input--xid (value)
+  "Return VALUE as an X window id, or nil."
+  (cond
+   ((integerp value) value)
+   ((and (stringp value) (string-match-p "\\`[0-9]+\\'" value))
+    (string-to-number value))))
+
+(defun exwm-input--frame-from-x-id (id)
+  "Workspace or floating frame whose X window is ID."
+  (when (and (integerp id) (/= id 0))
+    (cl-find-if
+     (lambda (frame)
+       (or (eq id (exwm-input--xid (frame-parameter frame 'exwm-outer-id)))
+           (eq id (exwm-input--xid (frame-parameter frame 'exwm-id)))
+           (eq id (exwm-input--xid (frame-parameter frame 'exwm-container)))
+           (eq id (exwm-input--xid (frame-parameter frame 'window-id)))
+           (eq id (exwm-input--xid (frame-parameter frame 'outer-window-id)))))
+     (frame-list))))
+
+(defun exwm-input--workspace-frame-at-root (root-x root-y)
+  "Workspace frame whose pixel rectangle contains ROOT-X, ROOT-Y."
+  (or (let ((reply (and exwm--connection
+                        (xcb:+request-unchecked+reply exwm--connection
+                            (make-instance 'xcb:QueryPointer
+                                           :window exwm--root)))))
+        (and reply (exwm-input--frame-from-x-id (slot-value reply 'child))))
+      (cl-find-if
+       (lambda (frame)
+         (when (and (frame-live-p frame)
+                    (fboundp 'exwm-workspace--workspace-p)
+                    (exwm-workspace--workspace-p frame))
+           (let ((pos (frame-position frame)))
+             (and pos
+                  (>= root-x (car pos))
+                  (>= root-y (cdr pos))
+                  (< root-x (+ (car pos) (frame-pixel-width frame)))
+                  (< root-y (+ (cdr pos) (frame-pixel-height frame)))))))
+       (frame-list))))
+
+(defun exwm-input--emacs-window-at-pointer ()
+  "Emacs window under the pointer when it is on a workspace frame.
+Nil when the pointer is over an X client.  `mouse-autoselect-window'
+does not run while X focus is on that client, so this is what
+moves focus back to eat, scratch, and other Emacs buffers."
+  (unless (exwm-input--managed-id-at-pointer)
+    (let ((pos (exwm-input--pointer-root-position)))
+      (when pos
+        (let ((frame (exwm-input--workspace-frame-at-root
+                      (car pos) (cdr pos)))
+              found)
+          (when (frame-live-p frame)
+            (dolist (window (window-list frame 'nomini))
+              (when (exwm-input--root-in-edges-p
+                     (car pos) (cdr pos)
+                     (window-absolute-pixel-edges window))
+                (setq found window)))
+            found))))))
+
+(defun exwm-input--window-at-pointer ()
+  "Window under the pointer: an X client if one is there, else Emacs."
+  (or (exwm-input--x-window-at-pointer)
+      (exwm-input--emacs-window-at-pointer)))
+
+(defvar exwm-input--pointer-poll-timer nil
+  "Timer that notices the pointer over X clients and Emacs windows.
+A tiled client is mapped above the frame, so Emacs
+`mouse-autoselect-window' cannot see it.  After that client has
+X focus, the same hook cannot move focus back to an Emacs
+window.  This timer handles both directions.")
+
+(defun exwm-input--poll-x-pointer-focus ()
+  "Schedule focus for the window under the pointer.
+The delay is `mouse-autoselect-window'.  Already-pending focus for
+the same window is left alone so the delay can finish."
+  (condition-case err
+      (when (and mouse-autoselect-window
+                 (fboundp 'exwm-input--window-at-pointer)
+                 (not (exwm-input--warping-p))
+                 (not (and (window-minibuffer-p)
+                           (minibuffer-window-active-p (selected-window)))))
+        (let ((window (exwm-input--window-at-pointer)))
+          (cond
+           ((null window)
+            (when (and (timerp exwm-input--enter-timer)
+                       (window-live-p exwm-input--enter-window)
+                       (not (exwm-input--pointer-over-window-p
+                             exwm-input--enter-window)))
+              (cancel-timer exwm-input--enter-timer)
+              (setq exwm-input--enter-timer nil
+                    exwm-input--enter-window nil)))
+           ((eq window (selected-window)))
+           ((and (timerp exwm-input--enter-timer)
+                 (eq window exwm-input--enter-window)))
+           (t
+            (let ((pos (exwm-input--pointer-root-position)))
+              (when pos
+                (exwm-input--schedule-enter-focus
+                 window (car pos) (cdr pos))))))))
+    (error (exwm--log "pointer poll: %s" err))))
+
+(defun exwm-input--start-pointer-poll ()
+  "Watch the pointer over X clients while autoselect is on."
+  (exwm-input--stop-pointer-poll)
+  (when mouse-autoselect-window
+    (setq exwm-input--pointer-poll-timer
+          (run-with-timer 0.1 0.1 #'exwm-input--poll-x-pointer-focus))))
+
+(defun exwm-input--stop-pointer-poll ()
+  "Stop watching the pointer over X clients."
+  (when (timerp exwm-input--pointer-poll-timer)
+    (cancel-timer exwm-input--pointer-poll-timer)
+    (setq exwm-input--pointer-poll-timer nil)))
+
+(defun exwm-input--select-entered-window (window)
+  "Select WINDOW because the pointer entered it.
+A floating window is not raised.  X input focus is set here
+because `mouse-autoselect-window' never ran for that client."
+  (when (and (window-live-p window)
+             (not (frame-parameter (window-frame window) 'no-accept-focus)))
+    (setq exwm-input--pointer-focus-window window)
+    (exwm-input--note-pointer-focus)
+    (unless (eq window (selected-window))
+      (select-window window))
+    (exwm-input--update-focus window)))
+
+(defun exwm-input--apply-enter-focus ()
+  "Select the entered window if the pointer is still over it."
+  (setq exwm-input--enter-timer nil)
+  (let* ((window exwm-input--enter-window)
+         (origin exwm-input--enter-position)
+         (pos (exwm-input--pointer-root-position))
+         (in-window (exwm-input--pointer-over-window-p window))
+         (moved (and pos origin (not (equal pos origin))))
+         (action (exwm-input--enter-action
+                  mouse-autoselect-window
+                  in-window
+                  moved
+                  (and (window-minibuffer-p)
+                       (minibuffer-window-active-p (selected-window)))
+                  (and (window-live-p window)
+                       (window-minibuffer-p window)))))
+    (pcase action
+      ('wait
+       (when pos
+         (exwm-input--schedule-enter-focus window (car pos) (cdr pos))))
+      ('select
+       (exwm-input--select-entered-window window)))))
+
+(defun exwm-input--schedule-enter-focus (window root-x root-y)
+  "Select WINDOW after the pointer has rested at ROOT-X, ROOT-Y.
+The wait is `mouse-autoselect-window', the same delay as Emacs
+windows.  Moving into another window replaces this request."
+  (when (timerp exwm-input--enter-timer)
+    (cancel-timer exwm-input--enter-timer))
+  (setq exwm-input--enter-window window
+        exwm-input--enter-position (cons root-x root-y)
+        exwm-input--enter-timer
+        (run-with-timer (exwm-input--enter-delay mouse-autoselect-window)
+                        nil #'exwm-input--apply-enter-focus)))
+
 (defun exwm-input--on-EnterNotify (data _synthetic)
-  "Handle EnterNotify events with DATA."
-  (with-slots (time root event root-x root-y event-x event-y state)
+  "Handle EnterNotify events with DATA.
+Crossing monitors switches workspace immediately.  A different
+window on the current monitor, including a GTK or other X client,
+is selected after `mouse-autoselect-window' seconds.  Emacs cannot
+see the pointer once it is over that client, so this does not use
+`mouse-position'."
+  (with-slots (root-x root-y event)
       (xcb:unmarshal-new 'xcb:EnterNotify data)
     (unless (exwm-input--warping-p)
-      (when-let* ((_(not (equal exwm-input--last-enter-notify-position
-                                (vector root-x root-y))))
-                  (buffer (exwm--id->buffer event))
-                  (window (get-buffer-window buffer t))
-                  (_(not (eq window (selected-window))))
-                  (frame (window-frame window))
-                  (frame-xid (frame-parameter frame 'exwm-id)))
-        (setq exwm-input--pointer-focus-window window)
-        (exwm--log "buffer=%s; window=%s" buffer window)
-      (unless (eq frame exwm-workspace--current)
-        (if (exwm-workspace--workspace-p frame)
-            ;; The X window is on another workspace.
-            (exwm-workspace-switch frame)
-          (with-current-buffer buffer
-            (when (and (derived-mode-p 'exwm-mode)
-                       (not (eq exwm--frame exwm-workspace--current)))
-              ;; The floating X window is on another workspace.
-              (exwm-workspace-switch exwm--frame)))))
-      ;; Send a fake MotionNotify event to Emacs.
-      (let* ((edges (exwm--window-inside-pixel-edges window))
-             (x (+ event-x (elt edges 0)))
-             (y (+ event-y (elt edges 1)))
-             (fake-evt (make-instance 'xcb:MotionNotify
-                                      :detail 0
-                                      :time time
-                                      :root root
-                                      :event frame-xid
-                                      :child xcb:Window:None
-                                      :root-x root-x
-                                      :root-y root-y
-                                      :event-x x
-                                      :event-y y
-                                      :state state
-                                      :same-screen 1)))
-        (xcb:+request exwm--connection
-            (make-instance 'xcb:SendEvent
-                           :propagate 0
-                           :destination frame-xid
-                           :event-mask xcb:EventMask:NoEvent
-                           :event (xcb:marshal fake-evt exwm--connection))))
-        (xcb:flush exwm--connection)))
+      (let* ((id (or (and (exwm--id->buffer event) event)
+                     (exwm-input--managed-id-from event)
+                     (exwm-input--managed-id-at-pointer)))
+             (window (exwm-input--window-for-client
+                      (exwm--id->buffer id) root-x root-y)))
+        (when (and window
+                   (not (eq window (selected-window)))
+                   (not (equal exwm-input--last-enter-notify-position
+                               (vector root-x root-y))))
+          (exwm--log "buffer=%s; window=%s" (window-buffer window) window)
+          (let ((workspace (exwm-input--window-workspace window)))
+            (unless (eq workspace exwm-workspace--current)
+              (if (exwm-workspace--workspace-p workspace)
+                  (exwm-workspace-switch workspace)
+                (with-current-buffer (window-buffer window)
+                  (when (and (derived-mode-p 'exwm-mode)
+                             (not (eq exwm--frame exwm-workspace--current)))
+                    (exwm-workspace-switch exwm--frame))))))
+          (if (eq (exwm-input--window-workspace window)
+                  exwm-workspace--current)
+              (exwm-input--schedule-enter-focus window root-x root-y)
+            (exwm-input--select-entered-window window)))))
     (setq exwm-input--last-enter-notify-position (vector root-x root-y))))
 
 (defun exwm-input--on-keysyms-update ()
@@ -646,7 +936,10 @@ attempt later."
                     (set-frame-parameter workspace 'exwm-selected-window
                                          window)
                     (exwm--defer 0 #'exwm-workspace-switch workspace)))
-                (exwm-floating--raise-emacs-frame frame))
+                ;; The pointer is already over this frame.  Raising it
+                ;; would bury whatever else is under the mouse.
+                (unless (exwm-input--pointer-focus-p)
+                  (exwm-floating--raise-emacs-frame frame)))
               (exwm-input--set-active-window
                (or (frame-parameter exwm-workspace--current 'exwm-outer-id)
                    xcb:Window:None)))
@@ -1919,7 +2212,8 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
               #'exwm-floating--do-moveresize)
   (when mouse-autoselect-window
     (xcb:+event exwm--connection 'xcb:EnterNotify
-                #'exwm-input--on-EnterNotify))
+                #'exwm-input--on-EnterNotify)
+    (exwm-input--start-pointer-poll))
   ;; Grab/Release keyboard when minibuffer/echo becomes active/inactive.
   (add-hook 'minibuffer-setup-hook #'exwm-input--on-minibuffer-setup)
   (add-hook 'minibuffer-exit-hook #'exwm-input--on-minibuffer-exit)
@@ -1970,7 +2264,13 @@ One use is to access the keymap bound to KEYS (as prefix keys) in `char-mode'."
   (define-key global-map [remap scroll-other-window-down] nil)
   (setq exwm-input--pointer-focus-until nil
         exwm-input--pointer-focus-window nil
-        exwm-input--warp-until nil)
+        exwm-input--warp-until nil
+        exwm-input--enter-window nil
+        exwm-input--enter-position nil)
+  (when (timerp exwm-input--enter-timer)
+    (cancel-timer exwm-input--enter-timer)
+    (setq exwm-input--enter-timer nil))
+  (exwm-input--stop-pointer-poll)
   (when exwm-input--update-focus-timer
     (cancel-timer exwm-input--update-focus-timer))
   ;; Make input focus working even without a WM.
