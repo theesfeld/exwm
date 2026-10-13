@@ -1,4 +1,4 @@
-;;; exwm-clipboard.el --- CLIPBOARD snapshot for EXWM  -*- lexical-binding: t -*-
+;;; exwm-clipboard.el --- Emacs owns CLIPBOARD in EXWM  -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 Free Software Foundation, Inc.
 
@@ -21,22 +21,36 @@
 
 ;;; Commentary:
 
-;; A copy inside an X client lives only as long as that client owns
-;; CLIPBOARD.  This module listens for XFixes selection-owner changes
-;; and pushes the text onto the kill ring, so it can still be yanked
-;; after the client exits.  `kill-new' leaves Emacs as the owner
-;; through `interprogram-cut-function'.  The primary selection is not
-;; watched.
+;; Emacs is the CLIPBOARD owner.  `M-w' copies onto the kill ring and
+;; `C-y' yanks from it.  Line-mode simulation keys send those to X
+;; clients as copy and paste.  When a client copies, this module reads
+;; CLIPBOARD and `kill-new's the text so Emacs owns it again.  The
+;; primary selection is not watched.
+
+;; `x-selection-owner-p' is Emacs's local alist, not the server.  A
+;; client can own CLIPBOARD while that flag is still t.  Then
+;; `gui-get-selection' returns the old kill, and a snapshot that
+;; trusted the flag would skip.  The server owner from
+;; `GetSelectionOwner' is what counts.  A stale local owner is
+;; dropped with `x-disown-selection-internal' (ignored by the server
+;; when Emacs is not the owner) before the read.
 
 ;;; Code:
 
 (require 'exwm-core)
 (require 'xcb-xfixes)
 
+(declare-function x-disown-selection-internal "xselect.c"
+                  (selection &optional time-object terminal))
+
 (defconst exwm-clipboard--timeout 500
   "Milliseconds to wait for a CLIPBOARD reply.
 `x-selection-timeout' is 0 by default, which waits forever.  A client
 that exits without answering must not freeze the window manager.")
+
+(defconst exwm-clipboard--settle 0.05
+  "Seconds to wait after an owner change before reading CLIPBOARD.
+The client needs a moment to finish offering the selection.")
 
 (defvar exwm-clipboard--atom nil
   "X atom for CLIPBOARD, or nil before initialization.")
@@ -52,15 +66,19 @@ that exits without answering must not freeze the window manager.")
 The XFixes event caused by that push is an echo and must not be
 copied again.")
 
+(defvar exwm-clipboard--timer nil
+  "Pending timer to take CLIPBOARD, or nil.")
+
+(defvar exwm-clipboard--event-time nil
+  "X server time of the last CLIPBOARD owner change, or nil.")
+
 (defcustom exwm-clipboard t
-  "Non-nil to copy CLIPBOARD text onto the kill ring.
+  "Non-nil to keep Emacs as the CLIPBOARD owner.
 
 A client copy is read when its owner changes and pushed with
-`kill-new', so the text remains after that client exits.  Emacs
-becomes the selection owner through `interprogram-cut-function'.
-An echo of that same text, including one from another clipboard
-manager, is not pushed again.  The primary selection is left to
-`select-enable-primary'.
+`kill-new', so Emacs owns CLIPBOARD again and the text remains
+after that client exits.  An echo of that same text is not pushed
+again.  The primary selection is left to `select-enable-primary'.
 
 Set this to nil to leave CLIPBOARD with the client that owns it."
   :type 'boolean
@@ -77,23 +95,27 @@ Set this to nil to leave CLIPBOARD with the client that owns it."
   "Return non-nil when TEXT should be pushed onto the kill ring.
 OWNER-P means Emacs already owns CLIPBOARD.  KILL-HEAD is the
 current kill-ring head, or nil.  The same text is refused so that
-this snapshot, or another clipboard manager that takes ownership of
-it, does not loop."
+this snapshot does not loop."
   (and (not exwm-clipboard--suppress)
        (not owner-p)
        (stringp text)
        (not (string-empty-p text))
        (not (and (stringp kill-head) (string= text kill-head)))))
 
+(defun exwm-clipboard--request-types ()
+  "Return CLIPBOARD targets to try, in order."
+  (let ((types (if (and (boundp 'x-select-request-type)
+                        x-select-request-type)
+                   x-select-request-type
+                 '(UTF8_STRING COMPOUND_TEXT STRING
+                               text/plain\;charset=utf-8 TEXT
+                               text/plain))))
+    (if (consp types) types (list types))))
+
 (defun exwm-clipboard--text ()
   "Return CLIPBOARD text, or nil when the selection is not text."
-  (let* ((types (if (and (boundp 'x-select-request-type)
-                         x-select-request-type)
-                    x-select-request-type
-                  '(UTF8_STRING COMPOUND_TEXT STRING
-                                text/plain\;charset=utf-8)))
-         (types (if (consp types) types (list types)))
-         text)
+  (let ((types (exwm-clipboard--request-types))
+        text)
     (while (and types (not (and (stringp text) (not (string-empty-p text)))))
       (condition-case err
           (setq text (gui-get-selection 'CLIPBOARD (car types)))
@@ -103,28 +125,116 @@ it, does not loop."
       (setq types (cdr types)))
     (and (stringp text) (not (string-empty-p text)) text)))
 
-(defun exwm-clipboard--snapshot ()
-  "Push the current CLIPBOARD text onto the kill ring."
+(defun exwm-clipboard--owner ()
+  "Return the X window that owns CLIPBOARD, or 0."
+  (if (and exwm--connection exwm-clipboard--atom)
+      (let ((reply (xcb:+request-unchecked+reply exwm--connection
+                       (make-instance 'xcb:GetSelectionOwner
+                                      :selection exwm-clipboard--atom))))
+        (or (and reply (slot-value reply 'owner)) 0))
+    0))
+
+(defun exwm-clipboard--xid (value)
+  "Return VALUE as an X window id, or nil."
+  (cond ((and (numberp value) (not (zerop value))) value)
+        ((and (stringp value) (string-match-p "\\`[0-9]+\\'" value)
+              (let ((n (string-to-number value)))
+                (and (not (zerop n)) n))))))
+
+(defun exwm-clipboard--emacs-xid-p (xid)
+  "Return non-nil if XID is an Emacs frame window on this display."
+  (let ((id (exwm-clipboard--xid xid)))
+    (and id
+         (catch 'found
+           (dolist (frame (frame-list))
+             (dolist (param '(window-id outer-window-id))
+               (let ((frame-id (exwm-clipboard--xid
+                                (frame-parameter frame param))))
+                 (when (and frame-id (= id frame-id))
+                   (throw 'found t)))))))))
+
+(defun exwm-clipboard--drop-stale-owner ()
+  "Forget a local CLIPBOARD owner flag that the server does not agree with.
+`x-disown-selection-internal' is ignored by the server when Emacs
+is not the owner, so a client's CLIPBOARD is left intact."
+  (when (and (fboundp 'gui-backend-selection-owner-p)
+             (gui-backend-selection-owner-p 'CLIPBOARD)
+             (fboundp 'x-disown-selection-internal))
+    (condition-case err
+        (x-disown-selection-internal 'CLIPBOARD)
+      (error (exwm--log "clipboard disown: %S" err)))))
+
+(defun exwm-clipboard--set-user-time (time)
+  "Use TIME as the X last-user-time so `SetSelectionOwner' is accepted.
+Emacs otherwise stamps the request with an older user event, and
+the server ignores it when a client has copied more recently."
+  (when (and time (fboundp 'x-display-set-last-user-time))
+    (x-display-set-last-user-time time)))
+
+(defun exwm-clipboard--claim (text)
+  "Make Emacs the CLIPBOARD owner of TEXT without a new kill-ring entry."
+  (when (and (stringp text) (not (string-empty-p text)))
+    (exwm-clipboard--set-user-time exwm-clipboard--event-time)
+    (let ((exwm-clipboard--suppress t)
+          (select-enable-clipboard t)
+          (select-enable-primary nil))
+      (gui-select-text text))))
+
+(defun exwm-clipboard--steal ()
+  "Read a client's CLIPBOARD and make Emacs the owner of that text."
+  (exwm-clipboard--drop-stale-owner)
+  (let* ((x-selection-timeout exwm-clipboard--timeout)
+         (text (exwm-clipboard--text))
+         (kill-head (car kill-ring)))
+    (exwm-clipboard--set-user-time exwm-clipboard--event-time)
+    (cond
+     ((exwm-clipboard--accept-p text nil kill-head)
+      (let ((exwm-clipboard--suppress t))
+        (kill-new text)))
+     ((and (stringp text) (not (string-empty-p text)))
+      (exwm-clipboard--claim text)))))
+
+(defun exwm-clipboard--take ()
+  "Make Emacs the CLIPBOARD owner of the current text, if any."
+  (setq exwm-clipboard--timer nil)
   (when (and exwm-clipboard--listening
              exwm--connection
              (not exwm-clipboard--suppress))
-    (let* ((x-selection-timeout exwm-clipboard--timeout)
-           (owner-p (and (fboundp 'gui-backend-selection-owner-p)
-                         (gui-backend-selection-owner-p 'CLIPBOARD))))
-      (unless owner-p
-        (let ((text (exwm-clipboard--text)))
-          (when (exwm-clipboard--accept-p text nil (car kill-ring))
-            (let ((exwm-clipboard--suppress t))
-              (kill-new text))))))))
+    (let ((owner (exwm-clipboard--owner)))
+      (cond
+       ((exwm-clipboard--emacs-xid-p owner))
+       ((zerop owner)
+        (exwm-clipboard--claim (car kill-ring)))
+       (t
+        (exwm-clipboard--steal))))))
+
+(defun exwm-clipboard--schedule (&optional time)
+  "Read CLIPBOARD after `exwm-clipboard--settle' seconds.
+TIME is the X server time of the owner change, when known."
+  (when time
+    (setq exwm-clipboard--event-time time))
+  (when (timerp exwm-clipboard--timer)
+    (cancel-timer exwm-clipboard--timer))
+  (setq exwm-clipboard--timer
+        (run-at-time exwm-clipboard--settle nil #'exwm-clipboard--take)))
+
+(defun exwm-clipboard--snapshot ()
+  "Push the current CLIPBOARD text onto the kill ring.
+Called from XFixes.  Defers so the client can finish offering the
+selection, then makes Emacs the owner."
+  (when (and exwm-clipboard--listening
+             exwm--connection
+             (not exwm-clipboard--suppress))
+    (exwm-clipboard--schedule)))
 
 (defun exwm-clipboard--on-notify (data _synthetic)
   "Snapshot CLIPBOARD after an XFixes SelectionNotify in DATA."
-  (when (and exwm-clipboard--listening exwm-clipboard--atom)
+  (when (and exwm-clipboard--listening exwm-clipboard--atom
+             (not exwm-clipboard--suppress))
     (let ((event (xcb:unmarshal-new 'xcb:xfixes:SelectionNotify data)))
-      (with-slots (selection owner) event
-        (when (and (= selection exwm-clipboard--atom)
-                   (not (zerop owner)))
-          (exwm-clipboard--snapshot))))))
+      (with-slots (selection timestamp) event
+        (when (= selection exwm-clipboard--atom)
+          (exwm-clipboard--schedule timestamp))))))
 
 (defun exwm-clipboard--select (mask)
   "Ask the server to deliver CLIPBOARD owner events for MASK."
@@ -163,13 +273,17 @@ it, does not loop."
            (logior xcb:xfixes:SelectionEventMask:SetSelectionOwner
                    xcb:xfixes:SelectionEventMask:SelectionWindowDestroy
                    xcb:xfixes:SelectionEventMask:SelectionClientClose))
-          (setq exwm-clipboard--listening t))
+          (setq exwm-clipboard--listening t)
+          (exwm-clipboard--schedule))
       (error
        (exwm--log "clipboard init: %S" err)
        (setq exwm-clipboard--listening nil)))))
 
 (defun exwm-clipboard--exit ()
   "Stop listening for CLIPBOARD owner changes."
+  (when (timerp exwm-clipboard--timer)
+    (cancel-timer exwm-clipboard--timer)
+    (setq exwm-clipboard--timer nil))
   (when (and exwm--connection exwm-clipboard--atom exwm-clipboard--listening)
     (condition-case err
         (exwm-clipboard--select 0)
@@ -178,10 +292,14 @@ it, does not loop."
 
 (defun exwm-clipboard--reset ()
   "Forget listener state.  Call this when the X connection is gone."
+  (when (timerp exwm-clipboard--timer)
+    (cancel-timer exwm-clipboard--timer))
   (setq exwm-clipboard--listening nil
         exwm-clipboard--registered nil
         exwm-clipboard--atom nil
-        exwm-clipboard--suppress nil))
+        exwm-clipboard--suppress nil
+        exwm-clipboard--timer nil
+        exwm-clipboard--event-time nil))
 
 (provide 'exwm-clipboard)
 
